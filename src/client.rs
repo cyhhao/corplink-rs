@@ -309,6 +309,30 @@ impl Client {
         Ok(())
     }
 
+    fn prepare_vpn_endpoint(&mut self, ip: &str, api_port: u16) {
+        let mut cookie = self.cookie.lock().unwrap();
+        let server_url = self.conf.server.clone().unwrap();
+
+        let mut url = Url::from_str(&server_url).unwrap();
+        let mut cookies: Vec<Cookie> = Vec::new();
+        for c in cookie.iter_any() {
+            if c.domain.matches(&url.clone()) {
+                cookies.push(c.clone());
+            }
+        }
+        url.set_host(Some(ip)).unwrap();
+        url.set_port(Some(api_port)).unwrap();
+        for c in cookies {
+            let mut c = cookie::Cookie::new(c.name().to_string(), c.value().to_string());
+            c.set_domain(ip.to_string());
+            let c = Cookie::try_from_raw_cookie(&c, &url.clone()).unwrap();
+            cookie.insert(c, &url.clone()).unwrap();
+        }
+        self.api_url.vpn_param.url = url.to_string().trim_end_matches('/').to_string();
+        drop(cookie);
+        self.save_cookie();
+    }
+
     async fn prompt_vpn_choice(&self, mut options: Vec<RespVpnInfo>) -> Result<RespVpnInfo, Error> {
         if options.is_empty() {
             return Err(Error::Error("no vpn available".to_string()));
@@ -834,29 +858,7 @@ impl Client {
 
     // ping vpn and return latency in ms. Will return -1 on error
     async fn ping_vpn(&mut self, ip: String, api_port: u16) -> i64 {
-        {
-            // config cookie
-            let mut cookie = self.cookie.lock().unwrap();
-            let server_url = self.conf.server.clone().unwrap();
-
-            let mut url = Url::from_str(&server_url).unwrap();
-            let mut cookies: Vec<Cookie> = Vec::new();
-            for c in cookie.iter_any() {
-                if c.domain.matches(&url.clone()) {
-                    cookies.push(c.clone());
-                }
-            }
-            url.set_host(Some(ip.as_str())).unwrap();
-            url.set_port(Some(api_port)).unwrap();
-            for c in cookies {
-                let mut c = cookie::Cookie::new(c.name().to_string(), c.value().to_string());
-                c.set_domain(ip.clone());
-                let c = Cookie::try_from_raw_cookie(&c, &url.clone()).unwrap();
-                cookie.insert(c, &url.clone()).unwrap();
-            }
-            self.api_url.vpn_param.url = url.to_string().trim_end_matches('/').to_string();
-        }
-        self.save_cookie();
+        self.prepare_vpn_endpoint(&ip, api_port);
         let req_start = Utc::now().timestamp_millis();
         let result = self.request::<String>(ApiName::PingVPN, None).await;
         let req_end = Utc::now().timestamp_millis();
@@ -978,6 +980,8 @@ impl Client {
             vpn_display_name(&selected_vpn),
             vpn_addr
         );
+
+        self.prepare_vpn_endpoint(&selected_vpn.ip, selected_vpn.api_port);
 
         let key = self.conf.public_key.clone().unwrap();
         log::info!("try to get wg conf from remote");
