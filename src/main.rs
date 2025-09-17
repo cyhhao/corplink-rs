@@ -140,8 +140,15 @@ async fn main() {
             }
         };
     }
-    log::info!("start wg-corplink for {}", &name);
     let wg_conf = wg_conf.unwrap();
+
+    if let Some(peer_ip) = extract_peer_host(&wg_conf.peer_address) {
+        if let Err(err) = c.ensure_peer_route(&peer_ip).await {
+            log::warn!("failed to ensure route to peer {}: {}", peer_ip, err);
+        }
+    }
+
+    log::info!("start wg-corplink for {}", &name);
     let protocol = wg_conf.protocol;
     if !wg::start_wg_go(&name, protocol, with_wg_log) {
         log::warn!("failed to start wg-corplink for {}", name);
@@ -153,12 +160,6 @@ async fn main() {
         Err(err) => {
             log::error!("failed to config interface with uapi for {}: {}", name, err);
             exit(EPERM);
-        }
-    }
-
-    if let Some(peer_ip) = extract_peer_host(&wg_conf.peer_address) {
-        if let Err(err) = c.ensure_peer_route(&peer_ip).await {
-            log::warn!("failed to ensure route to peer {}: {}", peer_ip, err);
         }
     }
 
