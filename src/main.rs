@@ -54,6 +54,19 @@ fn parse_arg() -> String {
     conf_file
 }
 
+fn extract_peer_host(peer_address: &str) -> Option<String> {
+    if peer_address.starts_with('[') {
+        let end = peer_address.find(']')?;
+        Some(peer_address[1..end].to_string())
+    } else if let Some(idx) = peer_address.rfind(':') {
+        Some(peer_address[..idx].to_string())
+    } else if peer_address.is_empty() {
+        None
+    } else {
+        Some(peer_address.to_string())
+    }
+}
+
 pub const EPERM: i32 = 1;
 pub const ENOENT: i32 = 2;
 pub const ETIMEDOUT: i32 = 110;
@@ -140,6 +153,12 @@ async fn main() {
         Err(err) => {
             log::error!("failed to config interface with uapi for {}: {}", name, err);
             exit(EPERM);
+        }
+    }
+
+    if let Some(peer_ip) = extract_peer_host(&wg_conf.peer_address) {
+        if let Err(err) = c.ensure_peer_route(&peer_ip).await {
+            log::warn!("failed to ensure route to peer {}: {}", peer_ip, err);
         }
     }
 
