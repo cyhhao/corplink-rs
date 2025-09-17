@@ -232,31 +232,6 @@ impl Client {
         utils::read_line().await
     }
 
-    fn cookie_snapshot_for_url(&self, url: &str) -> Vec<String> {
-        let parsed = match Url::parse(url) {
-            Ok(url) => url,
-            Err(_) => return Vec::new(),
-        };
-        let cookie = match self.cookie.lock() {
-            Ok(cookie) => cookie,
-            Err(_) => return Vec::new(),
-        };
-        cookie
-            .iter_any()
-            .filter(|c| c.domain.matches(&parsed))
-            .map(|c| {
-                format!(
-                    "{}={}; path={:?}; domain={:?}; secure={:?}",
-                    c.name(),
-                    c.value(),
-                    c.path(),
-                    c.domain(),
-                    c.secure()
-                )
-            })
-            .collect()
-    }
-
     #[cfg(target_os = "macos")]
     pub async fn ensure_peer_route(&self, peer_ip: &str) -> Result<(), Error> {
         let output = Command::new("route")
@@ -373,10 +348,8 @@ impl Client {
         let target_url = url.clone();
         let csrf_token = self.csrf_token_for_url(&target_url);
 
-        let mut body_string: Option<String> = None;
         let mut rb = if let Some(body) = body {
             let body_str = serde_json::to_string(&body).unwrap();
-            body_string = Some(body_str.clone());
             let mut req = self.c.post(url).body(body_str);
             req = req.header(header::CONTENT_TYPE, "application/json");
             req
@@ -384,23 +357,11 @@ impl Client {
             self.c.get(url)
         };
 
-        let cookie_snapshot = self.cookie_snapshot_for_url(&target_url);
-        log::debug!("request cookies for {}: {:?}", target_url, cookie_snapshot);
-
         if let Some(ref token) = csrf_token {
-            log::debug!("request url {} using csrf-token {}", target_url, token);
             if let Ok(header_value) = header::HeaderValue::from_str(token.as_str()) {
                 rb = rb.header("csrf-token", header_value.clone());
                 rb = rb.header("csrf_token", header_value);
             }
-        } else {
-            log::debug!("request url {} without csrf-token", target_url);
-        }
-
-        if let Some(body_str) = &body_string {
-            log::debug!("request body for {}: {}", target_url, body_str);
-        } else {
-            log::debug!("request body for {}: <empty>", target_url);
         }
 
         let resp = match rb.send().await {
@@ -415,26 +376,15 @@ impl Client {
 
         self.parse_time_offset_from_date_header(&resp);
 
-        let mut response_cookies = Vec::new();
-        for (name, value) in resp.headers() {
-            if name.to_string().to_lowercase() == "set-cookie" {
-                let cookie_val = value.to_str().unwrap_or("").to_string();
-                response_cookies.push(cookie_val);
+        for (name, _) in resp.headers() {
+            if name.as_str().eq_ignore_ascii_case("set-cookie") {
                 self.save_cookie();
             }
         }
-        if !response_cookies.is_empty() {
-            log::debug!(
-                "response set-cookie for {}: {:?}",
-                target_url,
-                response_cookies
-            );
-        }
-        let resp = resp.json::<Resp<T>>().await;
-        if let Err(err) = resp {
-            return Err(Error::ReqwestError(err));
-        }
-        let resp = resp.unwrap();
+        let resp = match resp.json::<Resp<T>>().await {
+            Ok(resp) => resp,
+            Err(err) => return Err(Error::ReqwestError(err)),
+        };
         log::debug!("api {:#?} resp: {:#?}", api, resp);
         Ok(resp)
     }
