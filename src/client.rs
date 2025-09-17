@@ -32,6 +32,16 @@ use tokio::process::Command;
 const COOKIE_FILE_SUFFIX: &str = "cookies.json";
 const USER_AGENT: &str = "CorpLink/3.1.17 (iPhone; iOS 18.6.2; Scale/3.00)";
 
+fn vpn_display_name(info: &RespVpnInfo) -> &str {
+    if !info.name.is_empty() {
+        info.name.as_str()
+    } else if !info.en_name.is_empty() {
+        info.en_name.as_str()
+    } else {
+        info.ip.as_str()
+    }
+}
+
 #[derive(Debug)]
 pub enum Error {
     ReqwestError(reqwest::Error),
@@ -297,6 +307,36 @@ impl Client {
     #[cfg(not(target_os = "macos"))]
     pub async fn ensure_peer_route(&self, _peer_ip: &str) -> Result<(), Error> {
         Ok(())
+    }
+
+    async fn prompt_vpn_choice(&self, mut options: Vec<RespVpnInfo>) -> Result<RespVpnInfo, Error> {
+        if options.is_empty() {
+            return Err(Error::Error("no vpn available".to_string()));
+        }
+        loop {
+            log::info!("请选择要连接的节点 (输入序号):");
+            for (idx, vpn) in options.iter().enumerate() {
+                log::info!(
+                    "[{}] {} ({}:{})",
+                    idx + 1,
+                    vpn_display_name(vpn),
+                    vpn.ip,
+                    vpn.vpn_port
+                );
+            }
+            let input = utils::read_line().await;
+            match input.trim().parse::<usize>() {
+                Ok(choice) if choice >= 1 && choice <= options.len() => {
+                    return Ok(options.remove(choice - 1));
+                }
+                _ => {
+                    log::warn!(
+                        "invalid selection, please enter a number between 1 and {}",
+                        options.len()
+                    );
+                }
+            }
+        }
     }
 
     async fn request<T: DeserializeOwned + fmt::Debug>(
@@ -768,7 +808,7 @@ impl Client {
 
             log::info!(
                 "server name {}{}",
-                vpn.en_name,
+                vpn_display_name(&vpn),
                 match latency {
                     -1 => " timeout".to_string(),
                     _ => format!(", latency {}ms", latency),
@@ -866,20 +906,11 @@ impl Client {
             vpn_info.len(),
             vpn_info
                 .iter()
-                .map(|i| i.en_name.clone())
+                .map(|i| vpn_display_name(i).to_string())
                 .collect::<Vec<String>>()
         );
-        let filtered_vpn = vpn_info
+        let protocol_filtered: Vec<RespVpnInfo> = vpn_info
             .into_iter()
-            .filter(|vpn| {
-                if let Some(server_name) = self.conf.vpn_server_name.clone() {
-                    if vpn.en_name != server_name {
-                        log::info!("skip {}, expect {}", vpn.en_name, server_name);
-                        return false;
-                    }
-                }
-                true
-            })
             .filter(|vpn| {
                 let mode = match vpn.protocol_mode {
                     1 => "tcp",
@@ -887,12 +918,11 @@ impl Client {
                     _ => "unknown protocol",
                 };
                 match mode {
-                    "udp" => true,
-                    "tcp" => true,
+                    "udp" | "tcp" => true,
                     _ => {
                         log::info!(
                             "server name {} is not support {} wg for now",
-                            vpn.en_name,
+                            vpn_display_name(vpn),
                             mode
                         );
                         false
@@ -901,21 +931,53 @@ impl Client {
             })
             .collect();
 
-        let vpn = match self.conf.vpn_select_strategy.clone() {
-            Some(strategy) => match strategy.as_str() {
-                STRATEGY_LATENCY => self.get_first_vpn_by_latency(filtered_vpn).await,
-                STRATEGY_DEFAULT => self.get_first_available_vpn(filtered_vpn).await,
-                _ => return Err(Error::Error("unsupported strategy".to_string())),
-            },
-            None => self.get_first_available_vpn(filtered_vpn).await,
+        if protocol_filtered.is_empty() {
+            return Err(Error::Error("no vpn available".to_string()));
+        }
+
+        let selected_vpn = if let Some(server_name) = self.conf.vpn_server_name.clone() {
+            let filtered: Vec<RespVpnInfo> = protocol_filtered
+                .into_iter()
+                .filter(|vpn| {
+                    if vpn.name != server_name {
+                        log::info!("skip {}, expect {}", vpn_display_name(vpn), server_name);
+                        false
+                    } else {
+                        true
+                    }
+                })
+                .collect();
+
+            if filtered.is_empty() {
+                return Err(Error::Error(format!(
+                    "no vpn available for {}",
+                    server_name
+                )));
+            }
+
+            let chosen = match self.conf.vpn_select_strategy.clone() {
+                Some(strategy) => match strategy.as_str() {
+                    STRATEGY_LATENCY => self.get_first_vpn_by_latency(filtered).await,
+                    STRATEGY_DEFAULT => self.get_first_available_vpn(filtered).await,
+                    _ => return Err(Error::Error("unsupported strategy".to_string())),
+                },
+                None => self.get_first_available_vpn(filtered).await,
+            };
+
+            match chosen {
+                Some(vpn) => vpn,
+                None => return Err(Error::Error("no vpn available".to_string())),
+            }
+        } else {
+            self.prompt_vpn_choice(protocol_filtered).await?
         };
 
-        let vpn = match vpn {
-            Some(ref vpn) => vpn,
-            None => return Err(Error::Error("no vpn available".to_string())),
-        };
-        let vpn_addr = format!("{}:{}", vpn.ip, vpn.vpn_port);
-        log::info!("try connect to {}, address {}", vpn.en_name, vpn_addr);
+        let vpn_addr = format!("{}:{}", selected_vpn.ip, selected_vpn.vpn_port);
+        log::info!(
+            "try connect to {}, address {}",
+            vpn_display_name(&selected_vpn),
+            vpn_addr
+        );
 
         let key = self.conf.public_key.clone().unwrap();
         log::info!("try to get wg conf from remote");
@@ -946,7 +1008,7 @@ impl Client {
             peer_key,
             route,
             dns,
-            protocol: match vpn.protocol_mode {
+            protocol: match selected_vpn.protocol_mode {
                 // tcp
                 1 => 1,
                 // udp
