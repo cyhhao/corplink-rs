@@ -234,6 +234,26 @@ impl Client {
 
     #[cfg(target_os = "macos")]
     pub async fn ensure_peer_route(&self, peer_ip: &str) -> Result<(), Error> {
+        // Remove any stale host route before querying the current gateway. This avoids
+        // keeping entries that point to gateways from a previous network (e.g. when
+        // switching Wi-Fi or tethering).
+        if let Ok(output) = Command::new("route")
+            .args(["-n", "delete", "-host", peer_ip])
+            .output()
+            .await
+        {
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if !stderr.contains("not in table") && !stderr.contains("no such process") {
+                    log::debug!(
+                        "failed to delete existing host route for {}: {}",
+                        peer_ip,
+                        stderr.trim()
+                    );
+                }
+            }
+        }
+
         let output = Command::new("route")
             .args(["-n", "get", peer_ip])
             .output()
@@ -285,6 +305,30 @@ impl Client {
     }
 
     fn prepare_vpn_endpoint(&mut self, ip: &str, api_port: u16) {
+        #[cfg(target_os = "macos")]
+        {
+            use std::process::{Command as StdCommand, Stdio};
+
+            if let Ok(output) = StdCommand::new("route")
+                .args(["-n", "delete", "-host", ip])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .output()
+            {
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    if !stderr.contains("not in table") && !stderr.contains("no such process") {
+                        log::debug!(
+                            "failed to delete existing host route before preparing endpoint {}: {}",
+                            ip,
+                            stderr.trim()
+                        );
+                    }
+                }
+            }
+        }
+
         let mut cookie = self.cookie.lock().unwrap();
         let server_url = self.conf.server.clone().unwrap();
 

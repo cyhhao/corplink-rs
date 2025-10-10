@@ -2,8 +2,8 @@ use std::error::Error;
 use std::io::{self, BufRead};
 
 use base32::Alphabet;
-use base64::Engine;
 use base64::engine::general_purpose::STANDARD as base64;
+use base64::Engine;
 use rand::rngs::OsRng;
 use x25519_dalek::{PublicKey, StaticSecret};
 
