@@ -168,7 +168,8 @@ async fn main() {
 
     #[cfg(target_os = "macos")]
     if use_vpn_dns {
-        match dns_manager.set_dns(vec![&wg_conf.dns], vec![]) {
+        let dns_domains: Vec<&str> = wg_conf.dns_domain_split.iter().map(|s| s.as_str()).collect();
+        match dns_manager.set_dns(vec![&wg_conf.dns], dns_domains) {
             Ok(_) => {}
             Err(err) => {
                 log::warn!("failed to set dns: {}", err);

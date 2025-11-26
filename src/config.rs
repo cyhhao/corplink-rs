@@ -46,6 +46,12 @@ pub struct Config {
     pub vpn_server_name: Option<String>,
     pub vpn_select_strategy: Option<String>,
     pub use_vpn_dns: Option<bool>,
+    /// Use full route mode (all traffic goes through VPN) instead of split route (default: false)
+    pub use_full_route: Option<bool>,
+    /// Auto add private network routes (10.0.0.0/8, 172.16.0.0/12) to split route (default: true)
+    pub include_private_routes: Option<bool>,
+    /// Extra routes to add (e.g. ["10.0.0.0/8", "172.16.0.0/12"])
+    pub extra_routes: Option<Vec<String>>,
 }
 
 impl fmt::Display for Config {
@@ -127,6 +133,7 @@ pub struct WgConf {
 
     // extra confs
     pub dns: String,
+    pub dns_domain_split: Vec<String>,
 
     // corplink confs
     pub protocol: i32,

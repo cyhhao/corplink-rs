@@ -120,7 +120,7 @@ impl Client {
         let mut cookie_store = {
             let file = fs::File::open(cookie_file).map(io::BufReader::new);
             match file {
-                Ok(file) => CookieStore::load_json_all(file).unwrap(),
+                Ok(file) => CookieStore::load_json_all(file).unwrap_or_default(),
                 Err(_) => CookieStore::default(),
             }
         };
@@ -989,11 +989,42 @@ impl Client {
         let address6 = (!wg_info.ipv6.is_empty())
             .then_some(format!("{}/128", wg_info.ipv6))
             .unwrap_or("".into());
-        let route = [
-            wg_info.setting.vpn_route_split,
-            wg_info.setting.v6_route_split.unwrap_or_default(),
-        ]
-        .concat();
+        let use_full_route = self.conf.use_full_route.unwrap_or(false);
+        let has_ipv6 = !wg_info.ipv6.is_empty();
+        let mut route = if use_full_route {
+            log::info!("using full route mode");
+            let mut routes = wg_info.setting.vpn_route_full;
+            if has_ipv6 {
+                routes.extend(wg_info.setting.v6_route_full);
+            }
+            routes
+        } else {
+            log::info!("using split route mode");
+            let mut routes = wg_info.setting.vpn_route_split;
+            if has_ipv6 {
+                routes.extend(wg_info.setting.v6_route_split.unwrap_or_default());
+            }
+            routes
+        };
+        // Auto add private network routes if enabled (default: true in split route mode)
+        let include_private = self.conf.include_private_routes.unwrap_or(!use_full_route);
+        if include_private && !use_full_route {
+            let private_routes = vec![
+                "10.0.0.0/8".to_string(),
+                "172.16.0.0/12".to_string(),
+            ];
+            log::info!("adding private network routes: {:?}", private_routes);
+            route.extend(private_routes);
+        }
+
+        // Add extra routes from config
+        if let Some(extra) = &self.conf.extra_routes {
+            log::info!("adding extra routes: {:?}", extra);
+            route.extend(extra.clone());
+        }
+
+        // Get DNS domain split config
+        let dns_domain_split = wg_info.setting.vpn_dns_domain_split.unwrap_or_default();
 
         // corplink config
         let wg_conf = WgConf {
@@ -1006,6 +1037,7 @@ impl Client {
             peer_key,
             route,
             dns,
+            dns_domain_split,
             protocol: match selected_vpn.protocol_mode {
                 // tcp
                 1 => 1,
