@@ -44,6 +44,23 @@ pub enum Command {
         /// Path to config JSON file
         config: String,
     },
+
+    /// (Internal) Privileged VPN daemon — spawned by `serve` via sudo
+    #[command(name = "connect-daemon", hide = true)]
+    ConnectDaemon {
+        /// Path to the profile config JSON file
+        #[arg(long)]
+        config: String,
+        /// Path to the named pipe for sending status events to the parent
+        #[arg(long)]
+        event_pipe: String,
+        /// UID of the unprivileged user that owns the config files
+        #[arg(long)]
+        owner_uid: u32,
+        /// GID of the unprivileged user that owns the config files
+        #[arg(long)]
+        owner_gid: u32,
+    },
 }
 
 impl Default for Command {

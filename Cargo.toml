@@ -66,3 +66,7 @@ dirs = "5"
 
 [build-dependencies]
 bindgen = "0.68"
+
+[dev-dependencies]
+tower = { version = "0.4", features = ["util"] }
+http-body-util = "0.1"

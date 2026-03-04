@@ -1,13 +1,13 @@
 use std::fmt;
 use tokio::fs;
 
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use crate::state::State;
 use crate::utils;
 
-const DEFAULT_DEVICE_NAME: &str = "DollarOS";
-const DEFAULT_INTERFACE_NAME: &str = "corplink";
+const DEFAULT_DEVICE_NAME: &str = "iPhone";
 
 pub const PLATFORM_LDAP: &str = "ldap";
 pub const PLATFORM_CORPLINK: &str = "feilian";
@@ -73,7 +73,8 @@ impl Config {
         conf.conf_file = Some(file.to_string());
         let mut update_conf = false;
         if conf.interface_name.is_none() {
-            conf.interface_name = Some(DEFAULT_INTERFACE_NAME.to_string());
+            let n: u32 = rand::thread_rng().gen_range(100..999);
+            conf.interface_name = Some(format!("utun{}", n));
             update_conf = true;
         }
         if conf.device_name.is_none() {
@@ -140,4 +141,6 @@ pub struct WgConf {
 
     // corplink confs
     pub protocol: i32,
+    /// Name of the selected VPN server node.
+    pub server_name: String,
 }

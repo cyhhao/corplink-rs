@@ -66,6 +66,8 @@ pub struct Client {
     c: reqwest::Client,
     api_url: ApiUrl,
     date_offset_sec: i32,
+    /// When true, never read from stdin (Web UI / headless mode).
+    headless: bool,
 }
 
 unsafe impl Send for Client {}
@@ -105,17 +107,32 @@ pub async fn get_company_url(code: &str) -> Result<RespCompany, Error> {
 
 impl Client {
     pub fn new(conf: Config) -> Result<Client, Error> {
+        Self::with_headless(conf, false)
+    }
+
+    pub fn new_headless(conf: Config) -> Result<Client, Error> {
+        Self::with_headless(conf, true)
+    }
+
+    fn with_headless(conf: Config, headless: bool) -> Result<Client, Error> {
         let f = conf.conf_file.clone().unwrap();
-        let dir = match path::Path::new(&f).parent() {
-            Some(dir) => dir,
-            None => path::Path::new("."),
+        let conf_path = path::Path::new(&f);
+        let parent = conf_path
+            .parent()
+            .unwrap_or(path::Path::new("."));
+
+        // Determine cookie directory: sibling "cookies/" for serve mode,
+        // same directory for legacy mode.
+        let cookie_dir = if parent.file_name().map_or(false, |n| n == "profiles") {
+            let base = parent.parent().unwrap_or(parent);
+            base.join("cookies")
+        } else {
+            parent.to_path_buf()
         };
-        let cookie_file = dir.join(format!(
-            "{}_{}",
-            conf.interface_name.clone().unwrap(),
-            COOKIE_FILE_SUFFIX
-        ));
-        log::info!("cookie file is: {}", cookie_file.to_str().unwrap());
+
+        let iface = conf.interface_name.clone().unwrap();
+        let cookie_file = cookie_dir.join(format!("{}_{}", iface, COOKIE_FILE_SUFFIX));
+        log::info!("cookie file is: {}", cookie_file.display());
 
         let mut cookie_store = {
             let file = fs::File::open(cookie_file).map(io::BufReader::new);
@@ -176,6 +193,7 @@ impl Client {
             c,
             api_url: ApiUrl::new(&conf_bak),
             date_offset_sec: 0,
+            headless,
         })
     }
 
@@ -187,19 +205,42 @@ impl Client {
     }
 
     fn save_cookie(&self) {
+        let cookie_path = self.cookie_file_path();
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create(true)
-            .append(false)
-            .open(format!(
-                "{}_{}",
-                self.conf.interface_name.clone().unwrap(),
-                COOKIE_FILE_SUFFIX
-            ))
+            .truncate(true)
+            .open(&cookie_path)
             .map(io::BufWriter::new)
             .unwrap();
         let c = self.cookie.lock().unwrap();
         c.save_json(&mut file).unwrap();
+    }
+
+    /// Derive the cookie file path.
+    /// - If the config file is under a `profiles/` directory (serve mode),
+    ///   cookies go to the sibling `cookies/` directory.
+    /// - Otherwise (legacy mode), cookies go next to the config file.
+    pub fn cookie_file_path(&self) -> std::path::PathBuf {
+        let conf_file = self.conf.conf_file.clone().unwrap();
+        let conf_path = path::Path::new(&conf_file);
+        let parent = conf_path
+            .parent()
+            .unwrap_or(path::Path::new("."));
+
+        let cookie_dir = if parent.file_name().map_or(false, |n| n == "profiles") {
+            // serve / connect-daemon mode: ~/.config/corplink/cookies/
+            let base = parent.parent().unwrap_or(parent);
+            let d = base.join("cookies");
+            let _ = std::fs::create_dir_all(&d);
+            d
+        } else {
+            // legacy mode: next to the config file
+            parent.to_path_buf()
+        };
+
+        let iface = self.conf.interface_name.clone().unwrap();
+        cookie_dir.join(format!("{}_{}", iface, COOKIE_FILE_SUFFIX))
     }
 
     fn csrf_token_for_url(&self, url: &str) -> Option<String> {
@@ -227,6 +268,10 @@ impl Client {
                 );
                 return otp;
             }
+        }
+        if self.headless {
+            log::error!("TOTP secret not configured — cannot generate 2FA code in headless mode");
+            return String::new();
         }
         if !prompt.is_empty() {
             log::info!("{}", prompt);
@@ -358,6 +403,16 @@ impl Client {
         if options.is_empty() {
             return Err(Error::Error("no vpn available".to_string()));
         }
+        // In headless mode, auto-select the first available VPN
+        if self.headless {
+            log::info!(
+                "headless mode: auto-selecting first VPN: {} ({}:{})",
+                vpn_display_name(&options[0]),
+                options[0].ip,
+                options[0].vpn_port
+            );
+            return Ok(options.remove(0));
+        }
         loop {
             log::info!("请选择要连接的节点 (输入序号):");
             for (idx, vpn) in options.iter().enumerate() {
@@ -485,6 +540,12 @@ impl Client {
         url: &String,
         token: &String,
     ) -> Result<String, Error> {
+        if self.headless {
+            return Err(Error::Error(format!(
+                "third-party login ({}) requires interactive browser auth — not supported in headless mode",
+                method
+            )));
+        }
         log::info!("old token is: {token}");
         log::info!("please scan the QR code or visit the following link to auth corplink:\n{url}");
         let code = TerminalQrCode::from_bytes(url.as_bytes());
@@ -534,6 +595,11 @@ impl Client {
             }
         }
         // Fallback: try email login
+        if self.headless {
+            return Err(Error::Error(
+                "no password provided and email login requires manual input — not supported in headless mode".into(),
+            ));
+        }
         log::info!("no password provided, trying email login");
         self.login_with_email().await
     }
@@ -601,6 +667,11 @@ impl Client {
             self.obtain_otp_code("input your 2fa code for mfa verify:")
                 .await
         } else {
+            if self.headless {
+                return Err(Error::Error(
+                    "email MFA requires manual input — not supported in headless mode".into(),
+                ));
+            }
             log::info!("input the verification code from your email:");
             utils::read_line().await
         };
@@ -851,7 +922,7 @@ impl Client {
         Error::Error(format!("operation failed because of logout: {}", msg))
     }
 
-    async fn list_vpn(&mut self) -> Result<Vec<RespVpnInfo>, Error> {
+    pub async fn list_vpn(&mut self) -> Result<Vec<RespVpnInfo>, Error> {
         let resp = self
             .request::<Vec<RespVpnInfo>>(ApiName::ListVPN, None)
             .await?;
@@ -1095,6 +1166,7 @@ impl Client {
                 // udp
                 _ => 0,
             },
+            server_name: vpn_display_name(&selected_vpn).to_string(),
         };
         Ok(wg_conf)
     }
