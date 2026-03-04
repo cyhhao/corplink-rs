@@ -1,4 +1,5 @@
 mod api;
+mod cli;
 mod client;
 mod config;
 mod dns;
@@ -8,6 +9,7 @@ mod state;
 mod template;
 mod totp;
 mod utils;
+mod web;
 mod wg;
 
 #[cfg(windows)]
@@ -16,43 +18,165 @@ use is_elevated;
 #[cfg(target_os = "macos")]
 use dns::DNSManager;
 
-use env_logger;
-use std::env;
+use clap::Parser;
+use std::path::PathBuf;
 use std::process::exit;
 
+use cli::{Cli, Command};
 use client::Client;
 use config::{Config, WgConf};
 
-fn print_usage_and_exit(name: &str, conf: &str) {
-    println!("usage:\n\t{} {}", name, conf);
-    exit(1);
+pub const EPERM: i32 = 1;
+pub const ENOENT: i32 = 2;
+pub const ETIMEDOUT: i32 = 110;
+
+/// Return the profiles directory, creating it if necessary.
+fn profiles_dir() -> PathBuf {
+    let dir = dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("corplink")
+        .join("profiles");
+    if !dir.exists() {
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| {
+            log::error!("failed to create profiles directory {}: {}", dir.display(), e);
+            exit(EPERM);
+        });
+    }
+    dir
 }
 
-fn parse_arg() -> String {
-    let mut conf_file = String::from("config.json");
-    let mut args = env::args();
-    // pop name
-    let name = args.next().unwrap();
-    match args.len() {
-        0 => {}
-        1 => {
-            // pop arg
-            let arg = args.next().unwrap();
-            match arg.as_str() {
-                "-h" | "--help" => {
-                    print_usage_and_exit(&name, &conf_file);
-                }
-                _ => {
-                    conf_file = arg;
+#[tokio::main]
+async fn main() {
+    env_logger::init();
+    print_version();
+    check_privilege();
+
+    let cli = Cli::parse();
+    let command = cli.command.unwrap_or_default();
+
+    match command {
+        Command::Serve { port, no_open } => cmd_serve(port, no_open).await,
+        Command::Connect { profile } => cmd_connect(&profile).await,
+        Command::Status => cmd_status().await,
+        Command::Profiles => cmd_profiles(),
+        Command::Legacy { config } => cmd_legacy(&config).await,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `corplink` / `corplink serve` — daemon + web UI
+// ---------------------------------------------------------------------------
+
+async fn cmd_serve(port: u16, no_open: bool) {
+    let dir = profiles_dir();
+    let state = web::state::new_app_state(dir);
+
+    if !no_open {
+        let url = format!("http://localhost:{}", port);
+        // Small delay so the server has time to bind before the browser hits it.
+        let url_clone = url.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if let Err(e) = open::that(&url_clone) {
+                log::warn!("failed to open browser: {}", e);
+            }
+        });
+    }
+
+    log::info!("starting web UI on port {}", port);
+    if let Err(e) = web::serve(state, port).await {
+        log::error!("web server error: {}", e);
+        exit(EPERM);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `corplink connect <profile>` — headless quick-connect
+// ---------------------------------------------------------------------------
+
+async fn cmd_connect(profile: &str) {
+    let dir = profiles_dir();
+    let conf_path = dir.join(format!("{}.json", profile));
+
+    if !conf_path.exists() {
+        log::error!("profile '{}' not found at {}", profile, conf_path.display());
+        exit(ENOENT);
+    }
+
+    let conf_path_str = conf_path.to_string_lossy().to_string();
+    run_legacy_flow(&conf_path_str).await;
+}
+
+// ---------------------------------------------------------------------------
+// `corplink status` — show connection status (reads daemon over HTTP)
+// ---------------------------------------------------------------------------
+
+async fn cmd_status() {
+    match reqwest::get("http://127.0.0.1:4027/api/status").await {
+        Ok(resp) => {
+            if let Ok(body) = resp.text().await {
+                println!("{}", body);
+            } else {
+                log::error!("failed to read status response");
+                exit(EPERM);
+            }
+        }
+        Err(_) => {
+            println!("corplink daemon is not running (cannot reach localhost:4027)");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `corplink profiles` — list available profiles
+// ---------------------------------------------------------------------------
+
+fn cmd_profiles() {
+    let dir = profiles_dir();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) => {
+            log::error!("failed to read {}: {}", dir.display(), e);
+            exit(EPERM);
+        }
+    };
+
+    let mut found = false;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().map_or(false, |ext| ext == "json") {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Ok(conf) = serde_json::from_str::<Config>(&content) {
+                    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+                    println!(
+                        "  {} — {} ({}@{})",
+                        stem,
+                        conf.company_name,
+                        conf.username,
+                        conf.server.as_deref().unwrap_or("unresolved")
+                    );
+                    found = true;
                 }
             }
         }
-        _ => {
-            print_usage_and_exit(&name, &conf_file);
-        }
     }
-    conf_file
+    if !found {
+        println!("no profiles found in {}", dir.display());
+        println!("place JSON config files there to get started.");
+    }
 }
+
+// ---------------------------------------------------------------------------
+// `corplink legacy <config>` — backward-compatible single-config mode
+// ---------------------------------------------------------------------------
+
+async fn cmd_legacy(conf_file: &str) {
+    run_legacy_flow(conf_file).await;
+}
+
+// ---------------------------------------------------------------------------
+// Shared: the original main() VPN flow, used by `connect` and `legacy`
+// ---------------------------------------------------------------------------
 
 fn extract_peer_host(peer_address: &str) -> Option<String> {
     if peer_address.starts_with('[') {
@@ -67,22 +191,18 @@ fn extract_peer_host(peer_address: &str) -> Option<String> {
     }
 }
 
-pub const EPERM: i32 = 1;
-pub const ENOENT: i32 = 2;
-pub const ETIMEDOUT: i32 = 110;
-
-#[tokio::main]
-async fn main() {
-    // NOTE: If you want to debug, you should set `RUST_LOG` env to `debug` and run corplink-rs in root
-    //  because `check_privilege` will call sudo and drop env if you're not root
-    env_logger::init();
-
-    print_version();
-    check_privilege();
-
-    let conf_file = parse_arg();
-    let mut conf = Config::from_file(&conf_file).await;
-    let name = conf.interface_name.clone().unwrap();
+async fn run_legacy_flow(conf_file: &str) {
+    let mut conf = match Config::from_file(conf_file).await {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("{}", e);
+            exit(EPERM);
+        }
+    };
+    let name = conf.interface_name.clone().unwrap_or_else(|| {
+        log::error!("interface_name not set in config");
+        exit(EPERM);
+    });
 
     #[cfg(target_os = "macos")]
     let use_vpn_dns = conf.use_vpn_dns.unwrap_or(false);
@@ -98,7 +218,9 @@ async fn main() {
                     resp.domain
                 );
                 conf.server = Some(resp.domain);
-                conf.save().await;
+                if let Err(e) = conf.save().await {
+                    log::warn!("failed to save config: {}", e);
+                }
             }
             Err(err) => {
                 log::error!(
@@ -112,14 +234,23 @@ async fn main() {
     }
 
     let with_wg_log = conf.debug_wg.unwrap_or_default();
-    let mut c = Client::new(conf).unwrap();
+    let mut c = match Client::new(conf) {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("failed to initialize client: {}", e);
+            exit(EPERM);
+        }
+    };
     let mut logout_retry = true;
     let wg_conf: Option<WgConf>;
 
     loop {
         if c.need_login() {
             log::info!("not login yet, try to login");
-            c.login().await.unwrap();
+            if let Err(e) = c.login().await {
+                log::error!("login failed: {}", e);
+                exit(EPERM);
+            }
             log::info!("login success");
         }
         log::info!("try to connect");
@@ -130,17 +261,17 @@ async fn main() {
             }
             Err(e) => {
                 if logout_retry && e.to_string().contains("logout") {
-                    // e contains detail message, so just print it out
                     log::warn!("{}", e);
                     logout_retry = false;
                     continue;
                 } else {
-                    panic!("{}", e);
+                    log::error!("connect failed: {}", e);
+                    exit(EPERM);
                 }
             }
         };
     }
-    let wg_conf = wg_conf.unwrap();
+    let wg_conf = wg_conf.expect("unreachable: loop above guarantees wg_conf is Some");
 
     if let Some(peer_ip) = extract_peer_host(&wg_conf.peer_address) {
         if let Err(err) = c.ensure_peer_route(&peer_ip).await {
@@ -179,23 +310,20 @@ async fn main() {
 
     let mut exit_code = 0;
     tokio::select! {
-        // handle signal
         _ = async {
             match tokio::signal::ctrl_c().await {
                 Ok(_) => {},
                 Err(e) => {
-                    log::warn!("failed to receive signal: {}",e);
+                    log::warn!("failed to receive signal: {}", e);
                 },
             }
-            log::info!("ctrl+v received");
+            log::info!("ctrl+c received");
         } => {},
 
-        // keep alive
         _ = c.keep_alive_vpn(&wg_conf, 60) => {
             exit_code = ETIMEDOUT;
         },
 
-        // check wg handshake and exit if timeout
         _ = async {
             uapi.check_wg_connection().await;
             log::warn!("last handshake timeout");

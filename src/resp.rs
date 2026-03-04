@@ -1,3 +1,7 @@
+// API response types — fields are kept even if unused on the Rust side,
+// because serde needs them for deserialization from the server JSON.
+#![allow(dead_code)]
+
 #[derive(serde::Deserialize, Debug)]
 pub struct Resp<T> {
     pub code: i32,
@@ -5,7 +9,6 @@ pub struct Resp<T> {
     pub message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<T>,
-
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
 }
@@ -34,12 +37,6 @@ pub struct RespTpsLoginMethod {
     pub alias: String,
     pub login_url: String,
     pub token: String,
-}
-
-#[derive(serde::Deserialize, Debug)]
-pub struct RespCorplinkLoginMethod {
-    pub mfa: bool,
-    pub auth: Vec<String>,
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -77,9 +74,8 @@ pub struct RespVpnInfo {
     pub api_port: u16,
     pub vpn_port: u16,
     pub ip: String,
-    // 1 for tcp, 2 for udp, we only support udp for now
+    /// 1 for tcp, 2 for udp
     pub protocol_mode: i32,
-    // useless
     pub name: String,
     pub en_name: String,
     pub icon: String,

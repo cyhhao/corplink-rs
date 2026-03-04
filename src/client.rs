@@ -181,7 +181,9 @@ impl Client {
 
     async fn change_state(&mut self, state: State) {
         self.conf.state = Some(state);
-        self.conf.save().await;
+        if let Err(e) = self.conf.save().await {
+            log::warn!("failed to save state: {}", e);
+        }
     }
 
     fn save_cookie(&self) {
@@ -496,7 +498,10 @@ impl Client {
             }
             _ => {
                 // TODO: add all tps login support
-                panic!("unsupported platform, please contact the developer");
+                Err(Error::Error(format!(
+                    "unsupported third-party login platform '{}', please contact the developer",
+                    method
+                )))
             }
         }
     }
@@ -733,7 +738,9 @@ impl Client {
                 if k == "secret" {
                     log::info!("got 2fa token: {}", &v);
                     self.conf.code = Some(v.to_string());
-                    self.conf.save().await;
+                    if let Err(e) = self.conf.save().await {
+                        log::warn!("failed to save 2fa token: {}", e);
+                    }
                     break;
                 }
             }
@@ -746,7 +753,7 @@ impl Client {
             log::warn!("failed to get otp code");
             return Ok(());
         }
-        panic!("no available login method, please provide a valid platform")
+        Err(Error::Error("no available login method, please provide a valid platform".to_string()))
     }
 
     async fn get_login_method(&mut self) -> Result<RespLoginMethod, Error> {
@@ -783,7 +790,7 @@ impl Client {
                 m.insert("account_type".to_string(), json!(account_type));
             }
             _ => {
-                panic!("invalid platform {platform}")
+                return Err(Error::Error(format!("invalid platform '{}'", platform)));
             }
         }
         m.insert("password".to_string(), json!(password));

@@ -1,9 +1,24 @@
 [package]
-name = "corplink-rs"
-version = "0.5.1"
+name = "corplink"
+version = "0.6.0"
 edition = "2021"
 
+[[bin]]
+name = "corplink"
+path = "src/main.rs"
+
 [dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+open = "5"
+
+# Web server
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors", "fs"] }
+rust-embed = { version = "8", features = ["mime-guess"] }
+mime_guess = "2"
+
+# HTTP client
 regex = "1.10"
 reqwest = { version = "0.11", features = [
     "json",
@@ -47,7 +62,7 @@ env_logger = "0.10"
 libc = "0.2"
 terminal_graphics = "0.1.5"
 qrcode = "0.14.1"
-
+dirs = "5"
 
 [build-dependencies]
 bindgen = "0.68"
