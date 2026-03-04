@@ -57,7 +57,7 @@ async fn main() {
     match command {
         Command::Serve { port, no_open } => cmd_serve(port, no_open).await,
         Command::Connect { profile } => cmd_connect(&profile).await,
-        Command::Status => cmd_status().await,
+        Command::Status { port } => cmd_status(port).await,
         Command::Profiles => cmd_profiles(),
         Command::Legacy { config } => cmd_legacy(&config).await,
     }
@@ -111,8 +111,9 @@ async fn cmd_connect(profile: &str) {
 // `corplink status` — show connection status (reads daemon over HTTP)
 // ---------------------------------------------------------------------------
 
-async fn cmd_status() {
-    match reqwest::get("http://127.0.0.1:4027/api/status").await {
+async fn cmd_status(port: u16) {
+    let url = format!("http://127.0.0.1:{}/api/status", port);
+    match reqwest::get(&url).await {
         Ok(resp) => {
             if let Ok(body) = resp.text().await {
                 println!("{}", body);
@@ -122,7 +123,7 @@ async fn cmd_status() {
             }
         }
         Err(_) => {
-            println!("corplink daemon is not running (cannot reach localhost:4027)");
+            println!("corplink daemon is not running (cannot reach localhost:{})", port);
         }
     }
 }

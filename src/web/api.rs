@@ -106,46 +106,61 @@ pub struct ConnectRequest {
     pub profile: String,
 }
 
+/// Validate that a profile name is safe (no path traversal).
+fn validate_profile_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("profile name cannot be empty".into());
+    }
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err("profile name contains invalid characters".into());
+    }
+    // Also reject hidden files
+    if name.starts_with('.') {
+        return Err("profile name cannot start with '.'".into());
+    }
+    Ok(())
+}
+
 pub async fn connect(
     State(state): State<AppState>,
     Json(req): Json<ConnectRequest>,
 ) -> (StatusCode, Json<ApiResponse<ConnectionInfo>>) {
-    // Quick check: already connected?
-    {
-        let inner = state.lock().await;
+    // Validate profile name against path traversal
+    if let Err(e) = validate_profile_name(&req.profile) {
+        return err_json(StatusCode::BAD_REQUEST, e);
+    }
+
+    // Atomic check-and-set: status check + mark Connecting in one lock scope.
+    // This prevents two concurrent requests from both passing the check.
+    let profile_path = {
+        let mut inner = state.lock().await;
         if inner.status == VpnStatus::Connected || inner.status == VpnStatus::Connecting {
             return err_json(
                 StatusCode::CONFLICT,
                 format!("already {:?}", inner.status),
             );
         }
-    }
 
-    // Resolve profile path
-    let profile_path = {
-        let inner = state.lock().await;
-        inner.profiles_dir.join(format!("{}.json", req.profile))
-    };
+        let path = inner.profiles_dir.join(format!("{}.json", req.profile));
+        if !path.exists() {
+            return err_json(
+                StatusCode::NOT_FOUND,
+                format!("profile '{}' not found", req.profile),
+            );
+        }
 
-    if !profile_path.exists() {
-        return err_json(
-            StatusCode::NOT_FOUND,
-            format!("profile '{}' not found", req.profile),
-        );
-    }
-
-    // Mark as connecting
-    {
-        let mut inner = state.lock().await;
+        // Atomically mark as connecting
         inner.status = VpnStatus::Connecting;
         inner.active_profile = Some(req.profile.clone());
         inner.last_error = None;
-    }
+
+        path
+    };
+    // Lock released here
 
     // Spawn the heavy VPN work in a background task so the HTTP response
     // returns immediately.
     let state_clone = state.clone();
-    let _profile_name = req.profile.clone();
     let profile_path_str = profile_path.to_string_lossy().to_string();
 
     tokio::spawn(async move {
@@ -178,12 +193,14 @@ async fn do_connect(state: AppState, config_path: &str) -> Result<(), String> {
         }
     }
 
-    let interface_name = conf.interface_name.clone()
+    let interface_name = conf
+        .interface_name
+        .clone()
         .ok_or_else(|| "interface_name not set in config".to_string())?;
     let with_wg_log = conf.debug_wg.unwrap_or_default();
 
     #[cfg(target_os = "macos")]
-    let use_vpn_dns = conf.use_vpn_dns.unwrap_or(false);
+    let _use_vpn_dns = conf.use_vpn_dns.unwrap_or(false);
 
     let mut client = Client::new(conf).map_err(|e| format!("client init failed: {}", e))?;
 
@@ -191,7 +208,10 @@ async fn do_connect(state: AppState, config_path: &str) -> Result<(), String> {
     let mut logout_retry = true;
     loop {
         if client.need_login() {
-            client.login().await.map_err(|e| format!("login failed: {}", e))?;
+            client
+                .login()
+                .await
+                .map_err(|e| format!("login failed: {}", e))?;
         }
         match client.connect_vpn().await {
             Ok(wg_conf) => {
@@ -205,22 +225,19 @@ async fn do_connect(state: AppState, config_path: &str) -> Result<(), String> {
                 // Start WireGuard
                 let protocol = wg_conf.protocol;
                 if !wg::start_wg_go(&interface_name, protocol, with_wg_log) {
-                    return Err(format!("failed to start wg-corplink for {}", interface_name));
+                    return Err(format!(
+                        "failed to start wg-corplink for {}",
+                        interface_name
+                    ));
                 }
 
                 let mut uapi = wg::UAPIClient {
                     name: interface_name.clone(),
                 };
-                uapi.config_wg(&wg_conf)
-                    .await
-                    .map_err(|e| format!("wg config failed: {}", e))?;
-
-                // Set DNS if requested
-                #[cfg(target_os = "macos")]
-                if use_vpn_dns {
-                    let dns_manager = crate::dns::DNSManager::new();
-                    // DNS management is best-effort
-                    let _ = dns_manager;
+                // FIX #4: if config_wg fails, stop WG to avoid resource leak
+                if let Err(e) = uapi.config_wg(&wg_conf).await {
+                    wg::stop_wg_go();
+                    return Err(format!("wg config failed: {}", e));
                 }
 
                 // Store state
@@ -247,11 +264,20 @@ async fn do_connect(state: AppState, config_path: &str) -> Result<(), String> {
                             log::warn!("wg handshake timeout");
                         } => {}
                     }
-                    // Connection lost — update state
+
+                    // FIX #5: Connection lost — clean up WG and all state fields
+                    // Best-effort disconnect from server
+                    let _ = client_ka.disconnect_vpn(&wg_conf_ka).await;
+                    wg::stop_wg_go();
+
                     let mut inner = state_ka.lock().await;
                     if inner.status == VpnStatus::Connected {
                         inner.status = VpnStatus::Disconnected;
                         inner.last_error = Some("connection lost (timeout)".to_string());
+                        inner.client = None;
+                        inner.wg_conf = None;
+                        inner.connected_since = None;
+                        inner.active_profile = None;
                     }
                 });
 
@@ -289,25 +315,39 @@ fn extract_peer_host(peer_address: &str) -> Option<String> {
 pub async fn disconnect(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<ApiResponse<ConnectionInfo>>) {
-    let (has_connection, wg_conf) = {
+    // FIX #3: Extract client + wg_conf from state, then release lock before
+    // any async work, so we don't block other tasks.
+    // FIX #4: Also allow disconnect from Error state so leaked WG can be cleaned.
+    let (client, wg_conf) = {
         let mut inner = state.lock().await;
-        if inner.status != VpnStatus::Connected {
-            return err_json(StatusCode::CONFLICT, "not connected");
-        }
-        inner.status = VpnStatus::Disconnecting;
-        (inner.client.is_some(), inner.wg_conf.clone())
-    };
-
-    if has_connection {
-        if let Some(wg_conf) = &wg_conf {
-            let mut inner = state.lock().await;
-            if let Some(ref mut client) = inner.client {
-                let _ = client.disconnect_vpn(wg_conf).await;
+        match inner.status {
+            VpnStatus::Connected | VpnStatus::Error => {}
+            _ => {
+                return err_json(
+                    StatusCode::CONFLICT,
+                    format!("cannot disconnect in {:?} state", inner.status),
+                );
             }
         }
-        crate::wg::stop_wg_go();
-    }
+        inner.status = VpnStatus::Disconnecting;
+        // Take ownership — moves out of state
+        (inner.client.take(), inner.wg_conf.take())
+    };
+    // Lock released here — no .await while holding the lock
 
+    // FIX #6: Capture disconnect error to report it
+    let mut disconnect_error: Option<String> = None;
+
+    if let (Some(mut client), Some(wg_conf)) = (client, wg_conf) {
+        if let Err(e) = client.disconnect_vpn(&wg_conf).await {
+            let msg = format!("server disconnect failed: {}", e);
+            log::warn!("{}", msg);
+            disconnect_error = Some(msg);
+        }
+    }
+    crate::wg::stop_wg_go();
+
+    // Clean up state
     {
         let mut inner = state.lock().await;
         inner.status = VpnStatus::Disconnected;
@@ -315,6 +355,7 @@ pub async fn disconnect(
         inner.wg_conf = None;
         inner.connected_since = None;
         inner.active_profile = None;
+        inner.last_error = disconnect_error;
     }
 
     let inner = state.lock().await;

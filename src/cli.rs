@@ -8,12 +8,14 @@ pub struct Cli {
     pub command: Option<Command>,
 }
 
+pub const DEFAULT_PORT: u16 = 4027;
+
 #[derive(Subcommand)]
 pub enum Command {
     /// Start the daemon and open the web management UI (default)
     Serve {
         /// Port for the web UI
-        #[arg(short, long, default_value_t = 4027)]
+        #[arg(short, long, default_value_t = DEFAULT_PORT)]
         port: u16,
 
         /// Don't open the browser automatically
@@ -28,7 +30,11 @@ pub enum Command {
     },
 
     /// Show current VPN connection status
-    Status,
+    Status {
+        /// Port of the running daemon
+        #[arg(short, long, default_value_t = DEFAULT_PORT)]
+        port: u16,
+    },
 
     /// List available profiles
     Profiles,
@@ -43,7 +49,7 @@ pub enum Command {
 impl Default for Command {
     fn default() -> Self {
         Command::Serve {
-            port: 4027,
+            port: DEFAULT_PORT,
             no_open: false,
         }
     }
