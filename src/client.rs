@@ -14,7 +14,6 @@ use reqwest::{ClientBuilder, Response, Url};
 use reqwest_cookie_store::CookieStoreMutex;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Map, Value};
-use sha2::Digest;
 
 use crate::api::{ApiName, ApiUrl, URL_GET_COMPANY};
 use crate::config::{
@@ -27,8 +26,21 @@ use crate::state::State;
 use crate::totp::{totp_offset, TIME_STEP};
 use crate::utils;
 
+#[cfg(target_os = "macos")]
+use tokio::process::Command;
+
 const COOKIE_FILE_SUFFIX: &str = "cookies.json";
-const USER_AGENT: &str = "CorpLink/201000 (GooglePixel; Android 10; en)";
+const USER_AGENT: &str = "CorpLink/3.2.16 (iPhone; iOS 15.8.3; Scale/2.00)";
+
+fn vpn_display_name(info: &RespVpnInfo) -> &str {
+    if !info.name.is_empty() {
+        info.name.as_str()
+    } else if !info.en_name.is_empty() {
+        info.en_name.as_str()
+    } else {
+        info.ip.as_str()
+    }
+}
 
 #[derive(Debug)]
 pub enum Error {
@@ -108,7 +120,7 @@ impl Client {
         let mut cookie_store = {
             let file = fs::File::open(cookie_file).map(io::BufReader::new);
             match file {
-                Ok(file) => CookieStore::load_json_all(file).unwrap(),
+                Ok(file) => CookieStore::load_json_all(file).unwrap_or_default(),
                 Err(_) => CookieStore::default(),
             }
         };
@@ -188,6 +200,188 @@ impl Client {
         c.save_json(&mut file).unwrap();
     }
 
+    fn csrf_token_for_url(&self, url: &str) -> Option<String> {
+        let parsed = Url::parse(url).ok()?;
+        let cookie = self.cookie.lock().ok()?;
+        for c in cookie.iter_any() {
+            if c.name() == "csrf-token" && c.domain.matches(&parsed) {
+                return Some(c.value().to_string());
+            }
+        }
+        None
+    }
+
+    async fn obtain_otp_code(&mut self, prompt: &str) -> String {
+        if let Some(code) = &self.conf.code {
+            if !code.is_empty() {
+                let code = utils::b32_decode(code);
+                let offset = self.date_offset_sec / TIME_STEP as i32;
+                let raw_otp = totp_offset(code.as_slice(), offset);
+                let otp = format!("{:06}", raw_otp.code);
+                log::info!(
+                    "2fa code generated: {}, {} seconds left",
+                    &otp,
+                    raw_otp.secs_left
+                );
+                return otp;
+            }
+        }
+        if !prompt.is_empty() {
+            log::info!("{}", prompt);
+        }
+        utils::read_line().await
+    }
+
+    #[cfg(target_os = "macos")]
+    pub async fn ensure_peer_route(&self, peer_ip: &str) -> Result<(), Error> {
+        // Remove any stale host route before querying the current gateway. This avoids
+        // keeping entries that point to gateways from a previous network (e.g. when
+        // switching Wi-Fi or tethering).
+        if let Ok(output) = Command::new("route")
+            .args(["-n", "delete", "-host", peer_ip])
+            .output()
+            .await
+        {
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if !stderr.contains("not in table") && !stderr.contains("no such process") {
+                    log::debug!(
+                        "failed to delete existing host route for {}: {}",
+                        peer_ip,
+                        stderr.trim()
+                    );
+                }
+            }
+        }
+
+        let output = Command::new("route")
+            .args(["-n", "get", peer_ip])
+            .output()
+            .await
+            .map_err(|e| Error::Error(format!("failed to run route get: {}", e)))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(Error::Error(format!(
+                "failed to get route for {peer_ip}: {stderr}"
+            )));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let gateway_line = stdout
+            .lines()
+            .find(|line| line.trim_start().starts_with("gateway:"));
+        let gateway = match gateway_line {
+            Some(line) => line.trim_start()[8..].trim(),
+            None => {
+                return Err(Error::Error(format!(
+                    "failed to parse gateway from route lookup for {peer_ip}"
+                )))
+            }
+        };
+        if gateway.is_empty() || gateway == "0.0.0.0" {
+            return Err(Error::Error(format!(
+                "invalid gateway {gateway} for peer {peer_ip}"
+            )));
+        }
+        let output = Command::new("route")
+            .args(["-n", "add", "-host", peer_ip, gateway])
+            .output()
+            .await
+            .map_err(|e| Error::Error(format!("failed to run route add: {}", e)))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.contains("File exists") {
+                return Err(Error::Error(format!(
+                    "failed to add host route for {peer_ip}: {stderr}"
+                )));
+            }
+        }
+        log::debug!("ensured host route to peer {} via {}", peer_ip, gateway);
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub async fn ensure_peer_route(&self, _peer_ip: &str) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn prepare_vpn_endpoint(&mut self, ip: &str, api_port: u16) {
+        #[cfg(target_os = "macos")]
+        {
+            use std::process::{Command as StdCommand, Stdio};
+
+            if let Ok(output) = StdCommand::new("route")
+                .args(["-n", "delete", "-host", ip])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .output()
+            {
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    if !stderr.contains("not in table") && !stderr.contains("no such process") {
+                        log::debug!(
+                            "failed to delete existing host route before preparing endpoint {}: {}",
+                            ip,
+                            stderr.trim()
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut cookie = self.cookie.lock().unwrap();
+        let server_url = self.conf.server.clone().unwrap();
+
+        let mut url = Url::from_str(&server_url).unwrap();
+        let mut cookies: Vec<Cookie> = Vec::new();
+        for c in cookie.iter_any() {
+            if c.domain.matches(&url.clone()) {
+                cookies.push(c.clone());
+            }
+        }
+        url.set_host(Some(ip)).unwrap();
+        url.set_port(Some(api_port)).unwrap();
+        for c in cookies {
+            let mut c = cookie::Cookie::new(c.name().to_string(), c.value().to_string());
+            c.set_domain(ip.to_string());
+            let c = Cookie::try_from_raw_cookie(&c, &url.clone()).unwrap();
+            cookie.insert(c, &url.clone()).unwrap();
+        }
+        self.api_url.vpn_param.url = url.to_string().trim_end_matches('/').to_string();
+        drop(cookie);
+        self.save_cookie();
+    }
+
+    async fn prompt_vpn_choice(&self, mut options: Vec<RespVpnInfo>) -> Result<RespVpnInfo, Error> {
+        if options.is_empty() {
+            return Err(Error::Error("no vpn available".to_string()));
+        }
+        loop {
+            log::info!("请选择要连接的节点 (输入序号):");
+            for (idx, vpn) in options.iter().enumerate() {
+                log::info!(
+                    "[{}] {} ({}:{})",
+                    idx + 1,
+                    vpn_display_name(vpn),
+                    vpn.ip,
+                    vpn.vpn_port
+                );
+            }
+            let input = utils::read_line().await;
+            match input.trim().parse::<usize>() {
+                Ok(choice) if choice >= 1 && choice <= options.len() => {
+                    return Ok(options.remove(choice - 1));
+                }
+                _ => {
+                    log::warn!(
+                        "invalid selection, please enter a number between 1 and {}",
+                        options.len()
+                    );
+                }
+            }
+        }
+    }
+
     async fn request<T: DeserializeOwned + fmt::Debug>(
         &mut self,
         api: ApiName,
@@ -195,13 +389,24 @@ impl Client {
     ) -> Result<Resp<T>, Error> {
         let url = self.api_url.get_api_url(&api);
 
-        let rb = match body {
-            Some(body) => {
-                let body = serde_json::to_string(&body).unwrap();
-                self.c.post(url).body(body)
-            }
-            None => self.c.get(url),
+        let target_url = url.clone();
+        let csrf_token = self.csrf_token_for_url(&target_url);
+
+        let mut rb = if let Some(body) = body {
+            let body_str = serde_json::to_string(&body).unwrap();
+            let mut req = self.c.post(url).body(body_str);
+            req = req.header(header::CONTENT_TYPE, "application/json");
+            req
+        } else {
+            self.c.get(url)
         };
+
+        if let Some(ref token) = csrf_token {
+            if let Ok(header_value) = header::HeaderValue::from_str(token.as_str()) {
+                rb = rb.header("csrf-token", header_value.clone());
+                rb = rb.header("csrf_token", header_value);
+            }
+        }
 
         let resp = match rb.send().await {
             Ok(r) => r,
@@ -216,17 +421,14 @@ impl Client {
         self.parse_time_offset_from_date_header(&resp);
 
         for (name, _) in resp.headers() {
-            if name.to_string().to_lowercase() == "set-cookie" {
-                log::info!("found set-cookie in header, saving cookie");
+            if name.as_str().eq_ignore_ascii_case("set-cookie") {
                 self.save_cookie();
-                break;
             }
         }
-        let resp = resp.json::<Resp<T>>().await;
-        if let Err(err) = resp {
-            return Err(Error::ReqwestError(err));
-        }
-        let resp = resp.unwrap();
+        let resp = match resp.json::<Resp<T>>().await {
+            Ok(resp) => resp,
+            Err(err) => return Err(Error::ReqwestError(err)),
+        };
         log::debug!("api {:#?} resp: {:#?}", api, resp);
         Ok(resp)
     }
@@ -300,47 +502,143 @@ impl Client {
     }
 
     async fn corplink_login(&mut self) -> Result<String, Error> {
-        let resp = self.get_corplink_login_method().await?;
-        for method in resp.auth {
-            match method.as_str() {
-                "password" => {
-                    if let Some(password) = &self.conf.password {
-                        if !password.is_empty() {
-                            log::info!("try to login with password");
-                            return self.login_with_password(PLATFORM_CORPLINK).await;
+        // New flow: directly login with password, server response drives MFA flow
+        if let Some(password) = &self.conf.password {
+            if !password.is_empty() {
+                log::info!("try to login with password");
+                let login_resp = self.login_with_password(PLATFORM_CORPLINK).await?;
+
+                // Handle server-driven next action
+                if let Some(next) = &login_resp.next {
+                    match next.action.as_str() {
+                        "2FA" => {
+                            log::info!("server requires 2FA, auth_list: {:?}", next.auth_list);
+                            self.handle_mfa(&next.auth_list).await?;
+                        }
+                        "GoToLink" => {
+                            log::info!("login succeeded, no MFA required");
+                        }
+                        other => {
+                            log::warn!("unknown next action: {other}, trying to continue");
                         }
                     }
-                    log::info!("no password provided, trying other methods");
-                    continue;
                 }
-                "email" => {
-                    log::info!("try to login with code from email");
-                    return self.login_with_email().await;
-                }
-                _ => {
-                    log::info!("unsupported method {method}, trying other methods");
-                }
+
+                // After login + MFA, request OTP
+                return self.request_otp_code().await;
             }
         }
-        panic!("failed to login with corplink");
+        // Fallback: try email login
+        log::info!("no password provided, trying email login");
+        self.login_with_email().await
+    }
+
+    /// Handle MFA based on server-provided auth_list.
+    /// Prefers OTP if user has TOTP secret configured, otherwise uses email.
+    async fn handle_mfa(&mut self, auth_list: &[String]) -> Result<(), Error> {
+        let has_totp_secret = self
+            .conf
+            .code
+            .as_ref()
+            .map_or(false, |c| !c.is_empty());
+
+        // Prefer OTP if user has TOTP secret and server supports it
+        if has_totp_secret && auth_list.contains(&"otp".to_string()) {
+            log::info!("using OTP for MFA (TOTP secret available)");
+            return self.verify_mfa(PLATFORM_CORPLINK, "otp").await;
+        }
+
+        // Fallback to email MFA
+        if auth_list.contains(&"email".to_string()) {
+            log::info!("using email for MFA");
+            self.send_mfa_code("email").await?;
+            log::info!("MFA code sent to email, please check your inbox");
+            return self.verify_mfa(PLATFORM_CORPLINK, "email").await;
+        }
+
+        // Try OTP even without saved secret (user can input manually)
+        if auth_list.contains(&"otp".to_string()) {
+            log::info!("using OTP for MFA (manual input)");
+            return self.verify_mfa(PLATFORM_CORPLINK, "otp").await;
+        }
+
+        Err(Error::Error(format!(
+            "no supported MFA method in auth_list: {:?}",
+            auth_list
+        )))
+    }
+
+    async fn send_mfa_code(&mut self, mfa_type: &str) -> Result<(), Error> {
+        let mut m = Map::new();
+        m.insert("account".to_string(), json!(&self.conf.username));
+        m.insert("mfa_type".to_string(), json!(mfa_type));
+        m.insert(
+            "login_scene".to_string(),
+            json!(PLATFORM_CORPLINK),
+        );
+
+        let resp = self
+            .request::<Value>(ApiName::LoginMfaSend, Some(m))
+            .await?;
+        match resp.code {
+            0 => Ok(()),
+            _ => {
+                let msg = resp
+                    .message
+                    .unwrap_or_else(|| "failed to send MFA code".to_string());
+                Err(Error::Error(msg))
+            }
+        }
+    }
+
+    async fn verify_mfa(&mut self, login_scene: &str, mfa_type: &str) -> Result<(), Error> {
+        let code = if mfa_type == "otp" {
+            self.obtain_otp_code("input your 2fa code for mfa verify:")
+                .await
+        } else {
+            log::info!("input the verification code from your email:");
+            utils::read_line().await
+        };
+
+        let mut m = Map::new();
+        m.insert("code".to_string(), json!(code));
+        m.insert("account".to_string(), json!(&self.conf.username));
+        m.insert("login_scene".to_string(), json!(login_scene));
+        m.insert("mfa_type".to_string(), json!(mfa_type));
+
+        log::debug!("mfa verify payload: {:?}", &m);
+
+        let resp = self
+            .request::<Value>(ApiName::LoginMfaVerify, Some(m))
+            .await?;
+        match resp.code {
+            0 => Ok(()),
+            _ => {
+                let msg = resp
+                    .message
+                    .unwrap_or_else(|| "mfa verification failed".to_string());
+                Err(Error::Error(msg))
+            }
+        }
     }
 
     async fn ldap_login(&mut self) -> Result<String, Error> {
-        // I don't know why but we must get login method before login
-        let resp = self.get_corplink_login_method().await?;
-        for method in resp.auth {
-            if method != "password" {
-                continue;
-            }
-            if let Some(password) = &self.conf.password {
-                return if !password.is_empty() {
-                    self.login_with_password(PLATFORM_LDAP).await
-                } else {
-                    Err(Error::Error("no password provided".to_string()))
-                };
+        if let Some(password) = &self.conf.password {
+            if !password.is_empty() {
+                log::info!("try to login with ldap password");
+                let login_resp = self.login_with_password(PLATFORM_LDAP).await?;
+
+                if let Some(next) = &login_resp.next {
+                    if next.action == "2FA" {
+                        log::info!("server requires 2FA for ldap, auth_list: {:?}", next.auth_list);
+                        self.handle_mfa(&next.auth_list).await?;
+                    }
+                }
+
+                return self.request_otp_code().await;
             }
         }
-        panic!("failed to login with ldap");
+        Err(Error::Error("no password provided for ldap".to_string()))
     }
 
     fn is_platform_or_default(&self, platform: &str) -> bool {
@@ -410,6 +708,7 @@ impl Client {
 
     // choose right login method and login
     pub async fn login(&mut self) -> Result<(), Error> {
+        self.api_url.refresh_code_challenge();
         let resp = self.get_login_method().await?;
         let tps_login_resp = self.get_tps_login_method().await?;
         let mut tps_login = HashMap::new();
@@ -465,44 +764,37 @@ impl Client {
         Ok(resp.data.unwrap_or_default())
     }
 
-    // get corplink login method, knowing result can be password or email
-    async fn get_corplink_login_method(&mut self) -> Result<RespCorplinkLoginMethod, Error> {
-        let mut m = Map::new();
-        m.insert("forget_password".to_string(), json!(false));
-        m.insert("user_name".to_string(), json!(&self.conf.username));
-
-        let resp = self
-            .request::<RespCorplinkLoginMethod>(ApiName::CorplinkLoginMethod, Some(m))
-            .await?;
-        Ok(resp.data.unwrap())
-    }
-
-    async fn login_with_password(&mut self, platform: &str) -> Result<String, Error> {
-        let mut password = self.conf.password.as_ref().unwrap().clone();
+    async fn login_with_password(&mut self, platform: &str) -> Result<RespLogin, Error> {
+        let password = self.conf.password.as_ref().unwrap().clone();
         let mut m = Map::new();
         match platform {
             PLATFORM_LDAP => {
                 m.insert("platform".to_string(), json!(PLATFORM_LDAP));
+                m.insert("user_name".to_string(), json!(&self.conf.username));
             }
             PLATFORM_CORPLINK => {
-                if password.len() != 64 {
-                    let mut sha = sha2::Sha256::new();
-                    sha.update(password.as_bytes());
-                    password = format!("{:x}", sha.finalize());
-                } // else: password already convert to sha256sum
+                m.insert("login_scene".to_string(), json!(PLATFORM_CORPLINK));
+                m.insert("account".to_string(), json!(&self.conf.username));
+                let account_type = if self.conf.username.contains('@') {
+                    "email"
+                } else {
+                    "account"
+                };
+                m.insert("account_type".to_string(), json!(account_type));
             }
             _ => {
                 panic!("invalid platform {platform}")
             }
         }
         m.insert("password".to_string(), json!(password));
-        m.insert("user_name".to_string(), json!(&self.conf.username));
+
+        log::debug!("login_with_password payload: {:?}", &m);
 
         let resp = self
             .request::<RespLogin>(ApiName::LoginPassword, Some(m))
             .await?;
         match resp.code {
-            0 => Ok(resp.data.unwrap().url),
+            0 => Ok(resp.data.unwrap()),
             _ => {
                 let msg = resp.message.unwrap();
                 Err(Error::Error(msg))
@@ -578,7 +870,7 @@ impl Client {
 
             log::info!(
                 "server name {}{}",
-                vpn.en_name,
+                vpn_display_name(&vpn),
                 match latency {
                     -1 => " timeout".to_string(),
                     _ => format!(", latency {}ms", latency),
@@ -604,29 +896,7 @@ impl Client {
 
     // ping vpn and return latency in ms. Will return -1 on error
     async fn ping_vpn(&mut self, ip: String, api_port: u16) -> i64 {
-        {
-            // config cookie
-            let mut cookie = self.cookie.lock().unwrap();
-            let server_url = self.conf.server.clone().unwrap();
-
-            let mut url = Url::from_str(&server_url).unwrap();
-            let mut cookies: Vec<Cookie> = Vec::new();
-            for c in cookie.iter_any() {
-                if c.domain.matches(&url.clone()) {
-                    cookies.push(c.clone());
-                }
-            }
-            url.set_host(Some(ip.as_str())).unwrap();
-            url.set_port(Some(api_port)).unwrap();
-            for c in cookies {
-                let mut c = cookie::Cookie::new(c.name().to_string(), c.value().to_string());
-                c.set_domain(ip.clone());
-                let c = Cookie::try_from_raw_cookie(&c, &url.clone()).unwrap();
-                cookie.insert(c, &url.clone()).unwrap();
-            }
-            self.api_url.vpn_param.url = url.to_string().trim_end_matches('/').to_string();
-        }
-        self.save_cookie();
+        self.prepare_vpn_endpoint(&ip, api_port);
         let req_start = Utc::now().timestamp_millis();
         let result = self.request::<String>(ApiName::PingVPN, None).await;
         let req_end = Utc::now().timestamp_millis();
@@ -650,24 +920,7 @@ impl Client {
     }
 
     async fn fetch_peer_info(&mut self, public_key: &String) -> Result<RespWgInfo, Error> {
-        let mut otp = String::new();
-        if let Some(code) = &self.conf.code {
-            if !code.is_empty() {
-                let code = utils::b32_decode(code);
-                let offset = self.date_offset_sec / TIME_STEP as i32;
-                let raw_otp = totp_offset(code.as_slice(), offset);
-                otp = format!("{:06}", raw_otp.code);
-                log::info!(
-                    "2fa code generated: {}, {} seconds left",
-                    &otp,
-                    raw_otp.secs_left
-                );
-            }
-        }
-        if otp.is_empty() {
-            log::info!("input your 2fa code:");
-            otp = utils::read_line().await;
-        }
+        let otp = self.obtain_otp_code("input your 2fa code:").await;
         let mut m = Map::new();
         m.insert("public_key".to_string(), json!(public_key));
         m.insert("otp".to_string(), json!(otp));
@@ -693,20 +946,11 @@ impl Client {
             vpn_info.len(),
             vpn_info
                 .iter()
-                .map(|i| i.en_name.clone())
+                .map(|i| vpn_display_name(i).to_string())
                 .collect::<Vec<String>>()
         );
-        let filtered_vpn = vpn_info
+        let protocol_filtered: Vec<RespVpnInfo> = vpn_info
             .into_iter()
-            .filter(|vpn| {
-                if let Some(server_name) = self.conf.vpn_server_name.clone() {
-                    if vpn.en_name != server_name {
-                        log::info!("skip {}, expect {}", vpn.en_name, server_name);
-                        return false;
-                    }
-                }
-                true
-            })
             .filter(|vpn| {
                 let mode = match vpn.protocol_mode {
                     1 => "tcp",
@@ -714,12 +958,11 @@ impl Client {
                     _ => "unknown protocol",
                 };
                 match mode {
-                    "udp" => true,
-                    "tcp" => true,
+                    "udp" | "tcp" => true,
                     _ => {
                         log::info!(
                             "server name {} is not support {} wg for now",
-                            vpn.en_name,
+                            vpn_display_name(vpn),
                             mode
                         );
                         false
@@ -728,21 +971,55 @@ impl Client {
             })
             .collect();
 
-        let vpn = match self.conf.vpn_select_strategy.clone() {
-            Some(strategy) => match strategy.as_str() {
-                STRATEGY_LATENCY => self.get_first_vpn_by_latency(filtered_vpn).await,
-                STRATEGY_DEFAULT => self.get_first_available_vpn(filtered_vpn).await,
-                _ => return Err(Error::Error("unsupported strategy".to_string())),
-            },
-            None => self.get_first_available_vpn(filtered_vpn).await,
+        if protocol_filtered.is_empty() {
+            return Err(Error::Error("no vpn available".to_string()));
+        }
+
+        let selected_vpn = if let Some(server_name) = self.conf.vpn_server_name.clone() {
+            let filtered: Vec<RespVpnInfo> = protocol_filtered
+                .into_iter()
+                .filter(|vpn| {
+                    if vpn.name != server_name {
+                        log::info!("skip {}, expect {}", vpn_display_name(vpn), server_name);
+                        false
+                    } else {
+                        true
+                    }
+                })
+                .collect();
+
+            if filtered.is_empty() {
+                return Err(Error::Error(format!(
+                    "no vpn available for {}",
+                    server_name
+                )));
+            }
+
+            let chosen = match self.conf.vpn_select_strategy.clone() {
+                Some(strategy) => match strategy.as_str() {
+                    STRATEGY_LATENCY => self.get_first_vpn_by_latency(filtered).await,
+                    STRATEGY_DEFAULT => self.get_first_available_vpn(filtered).await,
+                    _ => return Err(Error::Error("unsupported strategy".to_string())),
+                },
+                None => self.get_first_available_vpn(filtered).await,
+            };
+
+            match chosen {
+                Some(vpn) => vpn,
+                None => return Err(Error::Error("no vpn available".to_string())),
+            }
+        } else {
+            self.prompt_vpn_choice(protocol_filtered).await?
         };
 
-        let vpn = match vpn {
-            Some(ref vpn) => vpn,
-            None => return Err(Error::Error("no vpn available".to_string())),
-        };
-        let vpn_addr = format!("{}:{}", vpn.ip, vpn.vpn_port);
-        log::info!("try connect to {}, address {}", vpn.en_name, vpn_addr);
+        let vpn_addr = format!("{}:{}", selected_vpn.ip, selected_vpn.vpn_port);
+        log::info!(
+            "try connect to {}, address {}",
+            vpn_display_name(&selected_vpn),
+            vpn_addr
+        );
+
+        self.prepare_vpn_endpoint(&selected_vpn.ip, selected_vpn.api_port);
 
         let key = self.conf.public_key.clone().unwrap();
         log::info!("try to get wg conf from remote");
@@ -756,7 +1033,42 @@ impl Client {
         let address6 = (!wg_info.ipv6.is_empty())
             .then_some(format!("{}/128", wg_info.ipv6))
             .unwrap_or("".into());
-        let route = [wg_info.setting.vpn_route_split, wg_info.setting.v6_route_split.unwrap_or_default()].concat();
+        let use_full_route = self.conf.use_full_route.unwrap_or(false);
+        let has_ipv6 = !wg_info.ipv6.is_empty();
+        let mut route = if use_full_route {
+            log::info!("using full route mode");
+            let mut routes = wg_info.setting.vpn_route_full;
+            if has_ipv6 {
+                routes.extend(wg_info.setting.v6_route_full);
+            }
+            routes
+        } else {
+            log::info!("using split route mode");
+            let mut routes = wg_info.setting.vpn_route_split;
+            if has_ipv6 {
+                routes.extend(wg_info.setting.v6_route_split.unwrap_or_default());
+            }
+            routes
+        };
+        // Auto add private network routes if enabled (default: true in split route mode)
+        let include_private = self.conf.include_private_routes.unwrap_or(!use_full_route);
+        if include_private && !use_full_route {
+            let private_routes = vec![
+                "10.0.0.0/8".to_string(),
+                "172.16.0.0/12".to_string(),
+            ];
+            log::info!("adding private network routes: {:?}", private_routes);
+            route.extend(private_routes);
+        }
+
+        // Add extra routes from config
+        if let Some(extra) = &self.conf.extra_routes {
+            log::info!("adding extra routes: {:?}", extra);
+            route.extend(extra.clone());
+        }
+
+        // Get DNS domain split config
+        let dns_domain_split = wg_info.setting.vpn_dns_domain_split.unwrap_or_default();
 
         // corplink config
         let wg_conf = WgConf {
@@ -769,7 +1081,8 @@ impl Client {
             peer_key,
             route,
             dns,
-            protocol: match vpn.protocol_mode {
+            dns_domain_split,
+            protocol: match selected_vpn.protocol_mode {
                 // tcp
                 1 => 1,
                 // udp

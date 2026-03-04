@@ -54,6 +54,19 @@ fn parse_arg() -> String {
     conf_file
 }
 
+fn extract_peer_host(peer_address: &str) -> Option<String> {
+    if peer_address.starts_with('[') {
+        let end = peer_address.find(']')?;
+        Some(peer_address[1..end].to_string())
+    } else if let Some(idx) = peer_address.rfind(':') {
+        Some(peer_address[..idx].to_string())
+    } else if peer_address.is_empty() {
+        None
+    } else {
+        Some(peer_address.to_string())
+    }
+}
+
 pub const EPERM: i32 = 1;
 pub const ENOENT: i32 = 2;
 pub const ETIMEDOUT: i32 = 110;
@@ -127,8 +140,15 @@ async fn main() {
             }
         };
     }
-    log::info!("start wg-corplink for {}", &name);
     let wg_conf = wg_conf.unwrap();
+
+    if let Some(peer_ip) = extract_peer_host(&wg_conf.peer_address) {
+        if let Err(err) = c.ensure_peer_route(&peer_ip).await {
+            log::warn!("failed to ensure route to peer {}: {}", peer_ip, err);
+        }
+    }
+
+    log::info!("start wg-corplink for {}", &name);
     let protocol = wg_conf.protocol;
     if !wg::start_wg_go(&name, protocol, with_wg_log) {
         log::warn!("failed to start wg-corplink for {}", name);
@@ -148,7 +168,8 @@ async fn main() {
 
     #[cfg(target_os = "macos")]
     if use_vpn_dns {
-        match dns_manager.set_dns(vec![&wg_conf.dns], vec![]) {
+        let dns_domains: Vec<&str> = wg_conf.dns_domain_split.iter().map(|s| s.as_str()).collect();
+        match dns_manager.set_dns(vec![&wg_conf.dns], dns_domains) {
             Ok(_) => {}
             Err(err) => {
                 log::warn!("failed to set dns: {}", err);
