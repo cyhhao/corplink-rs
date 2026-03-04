@@ -10,43 +10,41 @@ use crate::template::Template;
 
 pub const URL_GET_COMPANY: &str = "https://corplink.volcengine.cn/api/match";
 
-const URL_GET_LOGIN_METHOD: &str =
-    "{{url}}/api/login/setting?app_version={{app_version}}&brand={{brand}}&build_number={{build_number}}&client_source={{client_source}}&language={{language}}&model={{model}}&os={{os}}&os_version={{version}}";
+macro_rules! api_url {
+    ($path:expr) => {
+        concat!("{{url}}", $path, "?", "app_version={{app_version}}&brand={{brand}}&build_number={{build_number}}&client_source={{client_source}}&language={{language}}&model={{model}}&os={{os}}&os_version={{version}}&timestamp={{timestamp}}")
+    };
+}
+
+const URL_GET_LOGIN_METHOD: &str = api_url!("/api/login/setting");
 const URL_GET_TPS_LOGIN_METHOD: &str =
-    "{{url}}/api/tpslogin/link?app_version={{app_version}}&brand={{brand}}&build_number={{build_number}}&client_source={{client_source}}&code_challenge={{code_challenge}}&language={{language}}&model={{model}}&os={{os}}&os_version={{version}}";
+    "{{url}}/api/tpslogin/link?app_version={{app_version}}&brand={{brand}}&build_number={{build_number}}&client_source={{client_source}}&code_challenge={{code_challenge}}&language={{language}}&model={{model}}&os={{os}}&os_version={{version}}&timestamp={{timestamp}}";
 const URL_GET_TPS_TOKEN_CHECK: &str =
-    "{{url}}/api/tpslogin/token/check?app_version={{app_version}}&brand={{brand}}&build_number={{build_number}}&client_source={{client_source}}&code_challenge={{code_challenge}}&language={{language}}&model={{model}}&os={{os}}&os_version={{version}}";
-const URL_GET_CORPLINK_LOGIN_METHOD: &str =
-    "{{url}}/api/lookup?app_version={{app_version}}&brand={{brand}}&build_number={{build_number}}&client_source={{client_source}}&language={{language}}&model={{model}}&os={{os}}&os_version={{version}}";
-const URL_REQUEST_CODE: &str =
-    "{{url}}/api/login/code/send?app_version={{app_version}}&brand={{brand}}&build_number={{build_number}}&client_source={{client_source}}&language={{language}}&model={{model}}&os={{os}}&os_version={{version}}";
-const URL_VERIFY_CODE: &str =
-    "{{url}}/api/login/code/verify?app_version={{app_version}}&brand={{brand}}&build_number={{build_number}}&client_source={{client_source}}&language={{language}}&model={{model}}&os={{os}}&os_version={{version}}";
-const URL_LOGIN_PASSWORD: &str =
-    "{{url}}/api/v1/login?app_version={{app_version}}&brand={{brand}}&build_number={{build_number}}&client_source={{client_source}}&language={{language}}&model={{model}}&os={{os}}&os_version={{version}}";
-const URL_LOGIN_MFA_VERIFY: &str =
-    "{{url}}/api/v1/login/mfa/verify?app_version={{app_version}}&brand={{brand}}&build_number={{build_number}}&client_source={{client_source}}&language={{language}}&model={{model}}&os={{os}}&os_version={{version}}";
-const URL_LIST_VPN: &str =
-    "{{url}}/api/vpn/list?app_version={{app_version}}&brand={{brand}}&build_number={{build_number}}&client_source={{client_source}}&language={{language}}&model={{model}}&os={{os}}&os_version={{version}}";
+    "{{url}}/api/tpslogin/token/check?app_version={{app_version}}&brand={{brand}}&build_number={{build_number}}&client_source={{client_source}}&code_challenge={{code_challenge}}&language={{language}}&model={{model}}&os={{os}}&os_version={{version}}&timestamp={{timestamp}}";
+const URL_REQUEST_CODE: &str = api_url!("/api/login/code/send");
+const URL_VERIFY_CODE: &str = api_url!("/api/login/code/verify");
+const URL_LOGIN_PASSWORD: &str = api_url!("/api/v1/login");
+const URL_LOGIN_MFA_SEND: &str = api_url!("/api/v1/login/mfa/send");
+const URL_LOGIN_MFA_VERIFY: &str = api_url!("/api/v1/login/mfa/verify");
+const URL_LIST_VPN: &str = api_url!("/api/vpn/list");
 
 const URL_PING_VPN_HOST: &str =
-    "{{url}}/vpn/ping?app_version={{app_version}}&brand={{brand}}&build_number={{build_number}}&client_source={{client_source}}&language={{language}}&model={{model}}&os={{os}}&os_version={{version}}";
+    "{{url}}/vpn/ping?app_version={{app_version}}&brand={{brand}}&build_number={{build_number}}&client_source={{client_source}}&language={{language}}&model={{model}}&os={{os}}&os_version={{version}}&timestamp={{timestamp}}";
 const URL_FETCH_PEER_INFO: &str =
-    "{{url}}/vpn/conn?app_version={{app_version}}&brand={{brand}}&build_number={{build_number}}&client_source={{client_source}}&language={{language}}&model={{model}}&os={{os}}&os_version={{version}}";
+    "{{url}}/vpn/conn?app_version={{app_version}}&brand={{brand}}&build_number={{build_number}}&client_source={{client_source}}&language={{language}}&model={{model}}&os={{os}}&os_version={{version}}&timestamp={{timestamp}}";
 const URL_OPERATE_VPN: &str =
-    "{{url}}/vpn/report?app_version={{app_version}}&brand={{brand}}&build_number={{build_number}}&client_source={{client_source}}&language={{language}}&model={{model}}&os={{os}}&os_version={{version}}";
-const URL_OTP: &str =
-    "{{url}}/api/v2/p/otp?app_version={{app_version}}&brand={{brand}}&build_number={{build_number}}&client_source={{client_source}}&language={{language}}&model={{model}}&os={{os}}&os_version={{version}}";
+    "{{url}}/vpn/report?app_version={{app_version}}&brand={{brand}}&build_number={{build_number}}&client_source={{client_source}}&language={{language}}&model={{model}}&os={{os}}&os_version={{version}}&timestamp={{timestamp}}";
+const URL_OTP: &str = api_url!("/api/v2/p/otp");
 
 #[derive(Clone, Hash, Eq, PartialEq, Debug)]
 pub enum ApiName {
     LoginMethod,
     TpsLoginMethod,
     TpsTokenCheck,
-    CorplinkLoginMethod,
     RequestEmailCode,
     LoginPassword,
     LoginEmail,
+    LoginMfaSend,
     LoginMfaVerify,
     ListVPN,
 
@@ -69,6 +67,7 @@ struct UserUrlParam {
     language: String,
     model: String,
     code_challenge: String,
+    timestamp: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -82,6 +81,7 @@ pub struct VpnUrlParam {
     client_source: String,
     language: String,
     model: String,
+    timestamp: String,
 }
 
 #[derive(Clone)]
@@ -95,14 +95,15 @@ pub struct ApiUrl {
 impl ApiUrl {
     pub fn new(conf: &Config) -> ApiUrl {
         let os = "iOS".to_string();
-        let version = "18.6.2".to_string();
-        let app_version = "3.1.17".to_string();
+        let version = "15.8.3".to_string();
+        let app_version = "3.2.16".to_string();
         let brand = "Apple".to_string();
-        let build_number = "500".to_string();
+        let build_number = "551".to_string();
         let client_source = "FeiLian".to_string();
-        let language = "zh".to_string();
-        let model = "iPhone14%2C2".to_string();
+        let language = "en".to_string();
+        let model = "iPhone9,1".to_string();
         let code_challenge = Self::generate_code_challenge();
+        let timestamp = Self::current_timestamp();
         let mut api_template = HashMap::new();
 
         api_template.insert(ApiName::LoginMethod, Template::new(URL_GET_LOGIN_METHOD));
@@ -114,13 +115,10 @@ impl ApiUrl {
             ApiName::TpsTokenCheck,
             Template::new(URL_GET_TPS_TOKEN_CHECK),
         );
-        api_template.insert(
-            ApiName::CorplinkLoginMethod,
-            Template::new(URL_GET_CORPLINK_LOGIN_METHOD),
-        );
         api_template.insert(ApiName::RequestEmailCode, Template::new(URL_REQUEST_CODE));
         api_template.insert(ApiName::LoginEmail, Template::new(URL_VERIFY_CODE));
         api_template.insert(ApiName::LoginPassword, Template::new(URL_LOGIN_PASSWORD));
+        api_template.insert(ApiName::LoginMfaSend, Template::new(URL_LOGIN_MFA_SEND));
         api_template.insert(ApiName::LoginMfaVerify, Template::new(URL_LOGIN_MFA_VERIFY));
         api_template.insert(ApiName::ListVPN, Template::new(URL_LIST_VPN));
         api_template.insert(ApiName::PingVPN, Template::new(URL_PING_VPN_HOST));
@@ -141,6 +139,7 @@ impl ApiUrl {
                 language: language.clone(),
                 model: model.clone(),
                 code_challenge: code_challenge.clone(),
+                timestamp: timestamp.clone(),
             },
             vpn_param: VpnUrlParam {
                 url: "".to_string(),
@@ -152,23 +151,29 @@ impl ApiUrl {
                 client_source,
                 language,
                 model,
+                timestamp,
             },
             api_template,
             code_challenge,
         }
     }
 
-    pub fn get_api_url(&self, name: &ApiName) -> String {
+    pub fn get_api_url(&mut self, name: &ApiName) -> String {
+        // refresh timestamp for each request
+        let ts = Self::current_timestamp();
+        self.user_param.timestamp = ts.clone();
+        self.vpn_param.timestamp = ts;
+
         let user_param = &self.user_param;
         let vpn_param = &self.vpn_param;
         match name {
             ApiName::LoginMethod => self.api_template[name].render(user_param),
             ApiName::TpsLoginMethod => self.api_template[name].render(user_param),
             ApiName::TpsTokenCheck => self.api_template[name].render(user_param),
-            ApiName::CorplinkLoginMethod => self.api_template[name].render(user_param),
             ApiName::RequestEmailCode => self.api_template[name].render(user_param),
             ApiName::LoginEmail => self.api_template[name].render(user_param),
             ApiName::LoginPassword => self.api_template[name].render(user_param),
+            ApiName::LoginMfaSend => self.api_template[name].render(user_param),
             ApiName::LoginMfaVerify => self.api_template[name].render(user_param),
             ApiName::ListVPN => self.api_template[name].render(user_param),
             ApiName::OTP => self.api_template[name].render(user_param),
@@ -191,5 +196,13 @@ impl ApiUrl {
         let mut bytes = [0u8; 32];
         rng.fill_bytes(&mut bytes);
         base64_url.encode(bytes)
+    }
+
+    fn current_timestamp() -> String {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .to_string()
     }
 }

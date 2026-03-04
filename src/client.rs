@@ -30,7 +30,7 @@ use crate::utils;
 use tokio::process::Command;
 
 const COOKIE_FILE_SUFFIX: &str = "cookies.json";
-const USER_AGENT: &str = "CorpLink/3.1.17 (iPhone; iOS 18.6.2; Scale/3.00)";
+const USER_AGENT: &str = "CorpLink/3.2.16 (iPhone; iOS 15.8.3; Scale/2.00)";
 
 fn vpn_display_name(info: &RespVpnInfo) -> &str {
     if !info.name.is_empty() {
@@ -502,47 +502,109 @@ impl Client {
     }
 
     async fn corplink_login(&mut self) -> Result<String, Error> {
-        let resp = self.get_corplink_login_method().await?;
-        let need_mfa = resp.mfa;
-        for method in resp.auth {
-            match method.as_str() {
-                "password" => {
-                    if let Some(password) = &self.conf.password {
-                        if !password.is_empty() {
-                            log::info!("try to login with password");
-                            let url = self.login_with_password(PLATFORM_CORPLINK).await?;
-                            if need_mfa {
-                                log::info!("mfa is required, verifying otp");
-                                self.verify_mfa(PLATFORM_CORPLINK).await?;
-                            }
-                            return Ok(url);
+        // New flow: directly login with password, server response drives MFA flow
+        if let Some(password) = &self.conf.password {
+            if !password.is_empty() {
+                log::info!("try to login with password");
+                let login_resp = self.login_with_password(PLATFORM_CORPLINK).await?;
+
+                // Handle server-driven next action
+                if let Some(next) = &login_resp.next {
+                    match next.action.as_str() {
+                        "2FA" => {
+                            log::info!("server requires 2FA, auth_list: {:?}", next.auth_list);
+                            self.handle_mfa(&next.auth_list).await?;
+                        }
+                        "GoToLink" => {
+                            log::info!("login succeeded, no MFA required");
+                        }
+                        other => {
+                            log::warn!("unknown next action: {other}, trying to continue");
                         }
                     }
-                    log::info!("no password provided, trying other methods");
-                    continue;
                 }
-                "email" => {
-                    log::info!("try to login with code from email");
-                    return self.login_with_email().await;
-                }
-                _ => {
-                    log::info!("unsupported method {method}, trying other methods");
-                }
+
+                // After login + MFA, request OTP
+                return self.request_otp_code().await;
             }
         }
-        panic!("failed to login with corplink");
+        // Fallback: try email login
+        log::info!("no password provided, trying email login");
+        self.login_with_email().await
     }
 
-    async fn verify_mfa(&mut self, login_scene: &str) -> Result<(), Error> {
-        let otp = self
-            .obtain_otp_code("input your 2fa code for mfa verify:")
-            .await;
+    /// Handle MFA based on server-provided auth_list.
+    /// Prefers OTP if user has TOTP secret configured, otherwise uses email.
+    async fn handle_mfa(&mut self, auth_list: &[String]) -> Result<(), Error> {
+        let has_totp_secret = self
+            .conf
+            .code
+            .as_ref()
+            .map_or(false, |c| !c.is_empty());
+
+        // Prefer OTP if user has TOTP secret and server supports it
+        if has_totp_secret && auth_list.contains(&"otp".to_string()) {
+            log::info!("using OTP for MFA (TOTP secret available)");
+            return self.verify_mfa(PLATFORM_CORPLINK, "otp").await;
+        }
+
+        // Fallback to email MFA
+        if auth_list.contains(&"email".to_string()) {
+            log::info!("using email for MFA");
+            self.send_mfa_code("email").await?;
+            log::info!("MFA code sent to email, please check your inbox");
+            return self.verify_mfa(PLATFORM_CORPLINK, "email").await;
+        }
+
+        // Try OTP even without saved secret (user can input manually)
+        if auth_list.contains(&"otp".to_string()) {
+            log::info!("using OTP for MFA (manual input)");
+            return self.verify_mfa(PLATFORM_CORPLINK, "otp").await;
+        }
+
+        Err(Error::Error(format!(
+            "no supported MFA method in auth_list: {:?}",
+            auth_list
+        )))
+    }
+
+    async fn send_mfa_code(&mut self, mfa_type: &str) -> Result<(), Error> {
+        let mut m = Map::new();
+        m.insert("account".to_string(), json!(&self.conf.username));
+        m.insert("mfa_type".to_string(), json!(mfa_type));
+        m.insert(
+            "login_scene".to_string(),
+            json!(PLATFORM_CORPLINK),
+        );
+
+        let resp = self
+            .request::<Value>(ApiName::LoginMfaSend, Some(m))
+            .await?;
+        match resp.code {
+            0 => Ok(()),
+            _ => {
+                let msg = resp
+                    .message
+                    .unwrap_or_else(|| "failed to send MFA code".to_string());
+                Err(Error::Error(msg))
+            }
+        }
+    }
+
+    async fn verify_mfa(&mut self, login_scene: &str, mfa_type: &str) -> Result<(), Error> {
+        let code = if mfa_type == "otp" {
+            self.obtain_otp_code("input your 2fa code for mfa verify:")
+                .await
+        } else {
+            log::info!("input the verification code from your email:");
+            utils::read_line().await
+        };
 
         let mut m = Map::new();
-        m.insert("code".to_string(), json!(otp));
+        m.insert("code".to_string(), json!(code));
         m.insert("account".to_string(), json!(&self.conf.username));
         m.insert("login_scene".to_string(), json!(login_scene));
-        m.insert("mfa_type".to_string(), json!("otp"));
+        m.insert("mfa_type".to_string(), json!(mfa_type));
 
         log::debug!("mfa verify payload: {:?}", &m);
 
@@ -561,21 +623,22 @@ impl Client {
     }
 
     async fn ldap_login(&mut self) -> Result<String, Error> {
-        // I don't know why but we must get login method before login
-        let resp = self.get_corplink_login_method().await?;
-        for method in resp.auth {
-            if method != "password" {
-                continue;
-            }
-            if let Some(password) = &self.conf.password {
-                return if !password.is_empty() {
-                    self.login_with_password(PLATFORM_LDAP).await
-                } else {
-                    Err(Error::Error("no password provided".to_string()))
-                };
+        if let Some(password) = &self.conf.password {
+            if !password.is_empty() {
+                log::info!("try to login with ldap password");
+                let login_resp = self.login_with_password(PLATFORM_LDAP).await?;
+
+                if let Some(next) = &login_resp.next {
+                    if next.action == "2FA" {
+                        log::info!("server requires 2FA for ldap, auth_list: {:?}", next.auth_list);
+                        self.handle_mfa(&next.auth_list).await?;
+                    }
+                }
+
+                return self.request_otp_code().await;
             }
         }
-        panic!("failed to login with ldap");
+        Err(Error::Error("no password provided for ldap".to_string()))
     }
 
     fn is_platform_or_default(&self, platform: &str) -> bool {
@@ -701,19 +764,7 @@ impl Client {
         Ok(resp.data.unwrap_or_default())
     }
 
-    // get corplink login method, knowing result can be password or email
-    async fn get_corplink_login_method(&mut self) -> Result<RespCorplinkLoginMethod, Error> {
-        let mut m = Map::new();
-        m.insert("forget_password".to_string(), json!(false));
-        m.insert("user_name".to_string(), json!(&self.conf.username));
-
-        let resp = self
-            .request::<RespCorplinkLoginMethod>(ApiName::CorplinkLoginMethod, Some(m))
-            .await?;
-        Ok(resp.data.unwrap())
-    }
-
-    async fn login_with_password(&mut self, platform: &str) -> Result<String, Error> {
+    async fn login_with_password(&mut self, platform: &str) -> Result<RespLogin, Error> {
         let password = self.conf.password.as_ref().unwrap().clone();
         let mut m = Map::new();
         match platform {
@@ -743,14 +794,7 @@ impl Client {
             .request::<RespLogin>(ApiName::LoginPassword, Some(m))
             .await?;
         match resp.code {
-            0 => {
-                let data = resp.data.unwrap();
-                if !data.url.is_empty() {
-                    Ok(data.url)
-                } else {
-                    Ok(String::new())
-                }
-            }
+            0 => Ok(resp.data.unwrap()),
             _ => {
                 let msg = resp.message.unwrap();
                 Err(Error::Error(msg))

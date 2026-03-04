@@ -43,7 +43,23 @@ pub struct RespCorplinkLoginMethod {
 }
 
 #[derive(serde::Deserialize, Debug)]
+pub struct RespLoginNext {
+    pub action: String,
+    #[serde(default)]
+    pub auth_list: Vec<String>,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub can_skip: bool,
+}
+
+#[derive(serde::Deserialize, Debug)]
 pub struct RespLogin {
+    #[serde(default)]
+    pub result: String,
+    #[serde(default)]
+    pub next: Option<RespLoginNext>,
+    // legacy field for backward compatibility
     #[serde(default)]
     pub url: String,
 }
@@ -52,6 +68,8 @@ pub struct RespLogin {
 pub struct RespOtp {
     pub url: String,
     pub code: String,
+    #[serde(default)]
+    pub need_verify: bool,
 }
 
 #[derive(serde::Deserialize, Debug)]
