@@ -10,6 +10,11 @@
 - `cargo check` — fast static analysis; run after every functional change to catch compile issues.
 - `cargo test` — execute unit/integration suites (none today, but command should pass cleanly).
 - `RUST_LOG=debug cargo run -- config/xxx.json` — run the client with verbose logging for endpoint debugging.
+- **IMPORTANT: After every code change, build BOTH frontend and backend before testing.** The React frontend is embedded into the Rust binary via `rust-embed`, so frontend changes are invisible until rebuilt:
+  ```bash
+  cd web && npm run build && cd .. && cargo build
+  ```
+  Use `SKIP_FRONTEND=1 cargo check` only for quick Rust-only type checking during development.
 
 ## Coding Style & Naming Conventions
 - Follow standard Rust formatting: 4-space indentation, snake_case for functions/modules, UpperCamelCase for types.

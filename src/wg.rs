@@ -50,6 +50,14 @@ pub fn start_wg_go(name: &str, protocol: i32, with_log: bool) -> bool {
         log_level = libwg::LogLevelVerbose;
     }
     let ret = start_wg(log_level, protocol, name);
+    if ret != 0 {
+        log::error!(
+            "startWg returned {} (ExitSetupFailed) for interface '{}' protocol={}",
+            ret,
+            name,
+            protocol
+        );
+    }
     matches!(ret, 0)
 }
 

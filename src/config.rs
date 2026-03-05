@@ -1,13 +1,13 @@
 use std::fmt;
 use tokio::fs;
 
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use crate::state::State;
 use crate::utils;
 
-const DEFAULT_DEVICE_NAME: &str = "DollarOS";
-const DEFAULT_INTERFACE_NAME: &str = "corplink";
+const DEFAULT_DEVICE_NAME: &str = "iPhone";
 
 pub const PLATFORM_LDAP: &str = "ldap";
 pub const PLATFORM_CORPLINK: &str = "feilian";
@@ -56,24 +56,25 @@ pub struct Config {
 
 impl fmt::Display for Config {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let s = serde_json::to_string_pretty(self).unwrap();
+        let s = serde_json::to_string_pretty(self).map_err(|_| fmt::Error)?;
         write!(f, "{}", s)
     }
 }
 
 impl Config {
-    pub async fn from_file(file: &str) -> Config {
+    pub async fn from_file(file: &str) -> Result<Config, String> {
         let conf_str = fs::read_to_string(file)
             .await
-            .unwrap_or_else(|e| panic!("failed to read config file {}: {}", file, e));
+            .map_err(|e| format!("failed to read config file {}: {}", file, e))?;
 
-        let mut conf: Config = serde_json::from_str(&conf_str[..])
-            .unwrap_or_else(|e| panic!("failed to parse config file {}: {}", file, e));
+        let mut conf: Config = serde_json::from_str(&conf_str)
+            .map_err(|e| format!("failed to parse config file {}: {}", file, e))?;
 
         conf.conf_file = Some(file.to_string());
         let mut update_conf = false;
         if conf.interface_name.is_none() {
-            conf.interface_name = Some(DEFAULT_INTERFACE_NAME.to_string());
+            let n: u32 = rand::thread_rng().gen_range(100..999);
+            conf.interface_name = Some(format!("utun{}", n));
             update_conf = true;
         }
         if conf.device_name.is_none() {
@@ -94,7 +95,8 @@ impl Config {
                 }
                 None => {
                     // only private key exists, generate public from private
-                    let public_key = utils::gen_public_key_from_private(private_key).unwrap();
+                    let public_key = utils::gen_public_key_from_private(private_key)
+                        .map_err(|e| format!("failed to derive public key: {}", e))?;
                     conf.public_key = Some(public_key);
                     update_conf = true;
                 }
@@ -107,15 +109,17 @@ impl Config {
             }
         }
         if update_conf {
-            conf.save().await;
+            conf.save().await.map_err(|e| format!("failed to save config: {}", e))?;
         }
-        conf
+        Ok(conf)
     }
 
-    pub async fn save(&self) {
-        let file = self.conf_file.as_ref().unwrap();
+    pub async fn save(&self) -> Result<(), String> {
+        let file = self.conf_file.as_ref().ok_or("conf_file not set")?;
         let data = format!("{}", &self);
-        fs::write(file, data).await.unwrap();
+        fs::write(file, data)
+            .await
+            .map_err(|e| format!("failed to write config file {}: {}", file, e))
     }
 }
 
@@ -137,4 +141,6 @@ pub struct WgConf {
 
     // corplink confs
     pub protocol: i32,
+    /// Name of the selected VPN server node.
+    pub server_name: String,
 }

@@ -1,13 +1,16 @@
 mod api;
+mod cli;
 mod client;
 mod config;
 mod dns;
+mod logging;
 mod qrcode;
 mod resp;
 mod state;
 mod template;
 mod totp;
 mod utils;
+mod web;
 mod wg;
 
 #[cfg(windows)]
@@ -16,42 +19,546 @@ use is_elevated;
 #[cfg(target_os = "macos")]
 use dns::DNSManager;
 
-use env_logger;
-use std::env;
+use clap::Parser;
+use std::path::PathBuf;
 use std::process::exit;
 
+use cli::{Cli, Command};
 use client::Client;
 use config::{Config, WgConf};
 
-fn print_usage_and_exit(name: &str, conf: &str) {
-    println!("usage:\n\t{} {}", name, conf);
-    exit(1);
+pub const EPERM: i32 = 1;
+pub const ENOENT: i32 = 2;
+pub const ETIMEDOUT: i32 = 110;
+
+/// Return the base XDG config directory (`~/.config`), respecting `SUDO_USER`
+/// when running under sudo (for `connect` / `legacy` commands).
+fn real_config_dir() -> PathBuf {
+    #[cfg(unix)]
+    if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+        if !sudo_user.is_empty() && sudo_user != "root" {
+            #[cfg(target_os = "macos")]
+            {
+                return PathBuf::from(format!("/Users/{}/.config", sudo_user));
+            }
+            #[cfg(all(unix, not(target_os = "macos")))]
+            {
+                return PathBuf::from(format!("/home/{}/.config", sudo_user));
+            }
+        }
+    }
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".config")
 }
 
-fn parse_arg() -> String {
-    let mut conf_file = String::from("config.json");
-    let mut args = env::args();
-    // pop name
-    let name = args.next().unwrap();
-    match args.len() {
-        0 => {}
-        1 => {
-            // pop arg
-            let arg = args.next().unwrap();
-            match arg.as_str() {
-                "-h" | "--help" => {
-                    print_usage_and_exit(&name, &conf_file);
+/// After writing a file as root (in connect-daemon), fix ownership so the
+/// normal user still owns their config files.
+#[cfg(unix)]
+pub(crate) fn chown_to_user(path: &std::path::Path, uid: u32, gid: u32) {
+    let _ = std::process::Command::new("chown")
+        .args([
+            &format!("{}:{}", uid, gid),
+            &path.to_string_lossy().into_owned(),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// Return the corplink config root: `~/.config/corplink`.
+fn config_dir() -> PathBuf {
+    real_config_dir().join("corplink")
+}
+
+/// Return the profiles directory (`~/.config/corplink/profiles`), creating it if necessary.
+fn profiles_dir() -> PathBuf {
+    let dir = config_dir().join("profiles");
+    if !dir.exists() {
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| {
+            log::error!(
+                "failed to create profiles directory {}: {}",
+                dir.display(),
+                e
+            );
+            exit(EPERM);
+        });
+    }
+    dir
+}
+
+/// Return the logs directory (`~/.config/corplink/logs`), creating it if necessary.
+fn logs_dir() -> PathBuf {
+    let dir = config_dir().join("logs");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// Return the cookies directory (`~/.config/corplink/cookies`), creating it if necessary.
+pub(crate) fn cookies_dir() -> PathBuf {
+    let dir = config_dir().join("cookies");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// Check whether the current process is running as root / admin.
+#[cfg(unix)]
+fn is_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[cfg(windows)]
+fn is_root() -> bool {
+    is_elevated::is_elevated()
+}
+
+#[tokio::main]
+async fn main() {
+    let log_dir = logs_dir();
+    logging::init(log_dir);
+    print_version();
+
+    let cli = Cli::parse();
+    let command = cli.command.unwrap_or_default();
+
+    match command {
+        // `serve` does NOT require root — the privileged connect-daemon
+        // child process is spawned on demand via osascript / sudo.
+        Command::Serve { port, no_open } => cmd_serve(port, no_open).await,
+
+        // CLI commands that directly perform VPN operations need root.
+        Command::Connect { profile } => {
+            check_privilege();
+            cmd_connect(&profile).await;
+        }
+        Command::Legacy { config } => {
+            check_privilege();
+            cmd_legacy(&config).await;
+        }
+
+        // Internal: already running as root (spawned by serve via osascript/sudo).
+        Command::ConnectDaemon {
+            config,
+            event_pipe,
+            owner_uid,
+            owner_gid,
+        } => {
+            if !is_root() {
+                log::error!("connect-daemon must be run as root");
+                exit(EPERM);
+            }
+            cmd_connect_daemon(&config, &event_pipe, owner_uid, owner_gid).await;
+        }
+
+        // Read-only commands — no privileges needed.
+        Command::Status { port } => cmd_status(port).await,
+        Command::Profiles => cmd_profiles(),
+        Command::Update { check } => cmd_update(check).await,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `corplink` / `corplink serve` — daemon + web UI (no root required)
+// ---------------------------------------------------------------------------
+
+async fn cmd_serve(port: u16, no_open: bool) {
+    let dir = profiles_dir();
+    // Ensure the cookies directory exists (normal user ownership).
+    let _ = cookies_dir();
+    let state = web::state::new_app_state(dir);
+
+    if !no_open {
+        let url = format!("http://localhost:{}", port);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if let Err(e) = open_browser(&url) {
+                log::warn!("failed to open browser: {}", e);
+            }
+        });
+    }
+
+    log::info!("starting web UI on port {}", port);
+
+    let state_for_shutdown = state.clone();
+    if let Err(e) = web::serve(state, port, state_for_shutdown).await {
+        log::error!("web server error: {}", e);
+        exit(EPERM);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `corplink connect-daemon` — privileged VPN child process (internal)
+//
+// Spawned by the web server via osascript (macOS) or sudo (Linux).
+// Communicates with the parent through a named pipe (JSON events).
+// ---------------------------------------------------------------------------
+
+async fn cmd_connect_daemon(config_path: &str, event_pipe_path: &str, owner_uid: u32, owner_gid: u32) {
+    use std::io::Write;
+
+    // Open the event pipe for writing.  The parent is already blocking on
+    // the read side, so this open will succeed immediately.
+    let mut pipe = match std::fs::OpenOptions::new()
+        .write(true)
+        .open(event_pipe_path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            log::error!("failed to open event pipe {}: {}", event_pipe_path, e);
+            exit(EPERM);
+        }
+    };
+
+    // Helper: write a JSON event line to the pipe.
+    macro_rules! emit {
+        ($val:expr) => {
+            if let Ok(json) = serde_json::to_string(&$val) {
+                let _ = writeln!(pipe, "{}", json);
+                let _ = pipe.flush();
+            }
+        };
+    }
+
+    // Notify parent of our PID so it can send SIGTERM to disconnect.
+    emit!(serde_json::json!({"event": "started", "pid": std::process::id()}));
+
+    // ── VPN flow (same logic as run_legacy_flow, but headless) ──────────
+
+    let mut conf = match Config::from_file(config_path).await {
+        Ok(c) => c,
+        Err(e) => {
+            emit!(serde_json::json!({"event": "error", "message": e}));
+            exit(EPERM);
+        }
+    };
+
+    if conf.server.is_none() {
+        match client::get_company_url(conf.company_name.as_str()).await {
+            Ok(resp) => {
+                log::info!(
+                    "resolved company: {}(zh)/{}(en) server={}",
+                    resp.zh_name,
+                    resp.en_name,
+                    resp.domain
+                );
+                conf.server = Some(resp.domain);
+                let _ = conf.save().await;
+                // Fix ownership: daemon runs as root but files belong to the user.
+                if let Some(ref cf) = conf.conf_file {
+                    chown_to_user(std::path::Path::new(cf), owner_uid, owner_gid);
                 }
-                _ => {
-                    conf_file = arg;
+            }
+            Err(e) => {
+                emit!(serde_json::json!({"event": "error", "message": format!("failed to resolve server: {}", e)}));
+                exit(EPERM);
+            }
+        }
+    }
+
+    // Use "utun" to let the kernel auto-assign the interface number.
+    // A fixed number (e.g. utun953) causes "resource busy" if a previous
+    // daemon was killed without proper cleanup.
+    let tun_name = "utun";
+    let with_wg_log = conf.debug_wg.unwrap_or_default();
+    let use_full_route = conf.use_full_route.unwrap_or(false);
+    #[cfg(target_os = "macos")]
+    let use_vpn_dns = conf.use_vpn_dns.unwrap_or(false);
+
+    let mut c = match Client::new_headless(conf) {
+        Ok(c) => c,
+        Err(e) => {
+            emit!(serde_json::json!({"event": "error", "message": format!("client init: {}", e)}));
+            exit(EPERM);
+        }
+    };
+
+    // Login + connect (with one automatic retry on "logout" error)
+    let mut logout_retry = true;
+    let wg_conf: WgConf = loop {
+        if c.need_login() {
+            log::info!("logging in...");
+            if let Err(e) = c.login().await {
+                emit!(serde_json::json!({"event": "error", "message": format!("login failed: {}", e)}));
+                exit(EPERM);
+            }
+        }
+        match c.connect_vpn().await {
+            Ok(conf) => break conf,
+            Err(e) => {
+                if logout_retry && e.to_string().contains("logout") {
+                    log::warn!("{}", e);
+                    logout_retry = false;
+                    continue;
+                }
+                emit!(serde_json::json!({"event": "error", "message": format!("connect failed: {}", e)}));
+                exit(EPERM);
+            }
+        }
+    };
+
+    // Fix ownership of files written as root back to the real user.
+    #[cfg(unix)]
+    {
+        chown_to_user(std::path::Path::new(config_path), owner_uid, owner_gid);
+        let cookie_path = c.cookie_file_path();
+        if let Some(cookie_dir) = cookie_path.parent() {
+            chown_to_user(cookie_dir, owner_uid, owner_gid);
+        }
+        chown_to_user(&cookie_path, owner_uid, owner_gid);
+    }
+
+    // Routes
+    if let Some(peer_ip) = extract_peer_host(&wg_conf.peer_address) {
+        if let Err(e) = c.ensure_peer_route(&peer_ip).await {
+            log::warn!("failed to ensure peer route: {}", e);
+        }
+    }
+
+    // WireGuard
+    log::info!("starting wg-corplink (tun={}, protocol={})", tun_name, wg_conf.protocol);
+    if !wg::start_wg_go(tun_name, wg_conf.protocol, with_wg_log) {
+        emit!(serde_json::json!({"event": "error", "message": format!("failed to start wg — check ~/.config/corplink/logs/daemon-stderr.log for details")}));
+        exit(EPERM);
+    }
+
+    let mut uapi = wg::UAPIClient {
+        name: tun_name.to_string(),
+    };
+    if let Err(e) = uapi.config_wg(&wg_conf).await {
+        wg::stop_wg_go();
+        emit!(serde_json::json!({"event": "error", "message": format!("wg config failed: {}", e)}));
+        exit(EPERM);
+    }
+
+    // DNS
+    #[cfg(target_os = "macos")]
+    let mut dns_manager = DNSManager::new();
+    #[cfg(target_os = "macos")]
+    if use_vpn_dns {
+        let dns_domains: Vec<&str> = wg_conf.dns_domain_split.iter().map(|s| s.as_str()).collect();
+        if let Err(e) = dns_manager.set_dns(vec![&wg_conf.dns], dns_domains) {
+            log::warn!("failed to set dns: {}", e);
+        }
+    }
+
+    // ── Connected — tell parent ─────────────────────────────────────────
+    emit!(serde_json::json!({
+        "event": "connected",
+        "vpn_ip": wg_conf.address,
+        "peer_address": wg_conf.peer_address,
+        "server_name": wg_conf.server_name,
+        "use_full_route": use_full_route,
+    }));
+
+    // ── Keep alive until signal, timeout, or shutdown request ────────────
+    //
+    // The parent process (corplink serve) cannot send Unix signals to us
+    // because we run as root and it runs as a normal user.  Instead, it
+    // creates a "shutdown" file in the temp directory to request disconnect.
+    // We poll for that file every 500 ms.
+    let shutdown_file = std::path::Path::new(event_pipe_path)
+        .parent()
+        .map(|d| d.join("shutdown"));
+
+    let disconnect_reason;
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            disconnect_reason = "signal";
+        }
+        _ = async {
+            #[cfg(unix)]
+            {
+                let mut sig = tokio::signal::unix::signal(
+                    tokio::signal::unix::SignalKind::terminate(),
+                ).expect("failed to register SIGTERM handler");
+                sig.recv().await;
+            }
+            #[cfg(not(unix))]
+            std::future::pending::<()>().await;
+        } => {
+            disconnect_reason = "signal";
+        }
+        _ = async {
+            if let Some(ref path) = shutdown_file {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    if path.exists() {
+                        log::info!("shutdown file detected: {}", path.display());
+                        break;
+                    }
+                }
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {
+            disconnect_reason = "shutdown_requested";
+        }
+        _ = c.keep_alive_vpn(&wg_conf, 60) => {
+            disconnect_reason = "keepalive_timeout";
+        }
+        _ = async {
+            uapi.check_wg_connection().await;
+        } => {
+            disconnect_reason = "handshake_timeout";
+        }
+    }
+
+    // ── Cleanup ─────────────────────────────────────────────────────────
+    // Order matters: stop WireGuard first so routes are removed and the
+    // user's network is restored immediately.  DNS and API notification
+    // happen afterwards over the normal (non-VPN) network.
+    log::info!("disconnecting vpn (reason: {})...", disconnect_reason);
+
+    // 1. Stop WireGuard — destroys TUN interface and removes all VPN routes.
+    wg::stop_wg_go();
+    log::info!("wireguard stopped, TUN interface destroyed");
+
+    // 2. Restore DNS.
+    #[cfg(target_os = "macos")]
+    if use_vpn_dns {
+        if let Err(e) = dns_manager.restore_dns() {
+            log::warn!("failed to restore dns: {}", e);
+        }
+    }
+
+    // 3. Remove the peer host route added by ensure_peer_route().
+    #[cfg(target_os = "macos")]
+    if let Some(peer_ip) = extract_peer_host(&wg_conf.peer_address) {
+        let _ = std::process::Command::new("route")
+            .args(["-n", "delete", "-host", &peer_ip])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        log::debug!("removed peer host route for {}", peer_ip);
+    }
+
+    // 4. Notify server (best effort, with timeout — network is normal now).
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        c.disconnect_vpn(&wg_conf),
+    ).await {
+        Ok(Ok(())) => log::info!("server notified of disconnect"),
+        Ok(Err(e)) => log::warn!("disconnect_vpn API failed: {}", e),
+        Err(_) => log::warn!("disconnect_vpn API timed out after 3s"),
+    }
+
+    emit!(serde_json::json!({"event": "disconnected", "reason": disconnect_reason}));
+}
+
+// ---------------------------------------------------------------------------
+// `corplink connect <profile>` — headless quick-connect (requires root)
+// ---------------------------------------------------------------------------
+
+async fn cmd_connect(profile: &str) {
+    let dir = profiles_dir();
+    let conf_path = dir.join(format!("{}.json", profile));
+
+    if !conf_path.exists() {
+        log::error!("profile '{}' not found at {}", profile, conf_path.display());
+        exit(ENOENT);
+    }
+
+    let conf_path_str = conf_path.to_string_lossy().to_string();
+    run_legacy_flow(&conf_path_str).await;
+}
+
+// ---------------------------------------------------------------------------
+// `corplink status` — show connection status (reads daemon over HTTP)
+// ---------------------------------------------------------------------------
+
+async fn cmd_status(port: u16) {
+    let url = format!("http://127.0.0.1:{}/api/status", port);
+    match reqwest::get(&url).await {
+        Ok(resp) => {
+            if let Ok(body) = resp.text().await {
+                println!("{}", body);
+            } else {
+                log::error!("failed to read status response");
+                exit(EPERM);
+            }
+        }
+        Err(_) => {
+            println!(
+                "corplink daemon is not running (cannot reach localhost:{})",
+                port
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `corplink profiles` — list available profiles
+// ---------------------------------------------------------------------------
+
+fn cmd_profiles() {
+    let dir = profiles_dir();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) => {
+            log::error!("failed to read {}: {}", dir.display(), e);
+            exit(EPERM);
+        }
+    };
+
+    let mut found = false;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().map_or(false, |ext| ext == "json") {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Ok(conf) = serde_json::from_str::<Config>(&content) {
+                    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+                    println!(
+                        "  {} — {} ({}@{})",
+                        stem,
+                        conf.company_name,
+                        conf.username,
+                        conf.server.as_deref().unwrap_or("unresolved")
+                    );
+                    found = true;
                 }
             }
         }
-        _ => {
-            print_usage_and_exit(&name, &conf_file);
+    }
+    if !found {
+        println!("no profiles found in {}", dir.display());
+        println!("place JSON config files there to get started.");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `corplink legacy <config>` — backward-compatible single-config mode
+// ---------------------------------------------------------------------------
+
+async fn cmd_legacy(conf_file: &str) {
+    run_legacy_flow(conf_file).await;
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+/// Open a URL in the user's default browser.
+/// Under sudo, `open` runs as root and may pick Safari instead of the user's
+/// default browser.  We detect SUDO_USER and run `open` as that user.
+fn open_browser(url: &str) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+            log::debug!(
+                "running under sudo, opening browser as user '{}'",
+                sudo_user
+            );
+            let status = std::process::Command::new("sudo")
+                .args(["-u", &sudo_user, "open", url])
+                .status()?;
+            if !status.success() {
+                return Err(format!("open exited with {}", status).into());
+            }
+            return Ok(());
         }
     }
-    conf_file
+    open::that(url)?;
+    Ok(())
 }
 
 fn extract_peer_host(peer_address: &str) -> Option<String> {
@@ -67,22 +574,22 @@ fn extract_peer_host(peer_address: &str) -> Option<String> {
     }
 }
 
-pub const EPERM: i32 = 1;
-pub const ENOENT: i32 = 2;
-pub const ETIMEDOUT: i32 = 110;
+// ---------------------------------------------------------------------------
+// Legacy flow — used by `connect` and `legacy` commands (runs in-process)
+// ---------------------------------------------------------------------------
 
-#[tokio::main]
-async fn main() {
-    // NOTE: If you want to debug, you should set `RUST_LOG` env to `debug` and run corplink-rs in root
-    //  because `check_privilege` will call sudo and drop env if you're not root
-    env_logger::init();
-
-    print_version();
-    check_privilege();
-
-    let conf_file = parse_arg();
-    let mut conf = Config::from_file(&conf_file).await;
-    let name = conf.interface_name.clone().unwrap();
+async fn run_legacy_flow(conf_file: &str) {
+    let mut conf = match Config::from_file(conf_file).await {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("{}", e);
+            exit(EPERM);
+        }
+    };
+    let name = conf.interface_name.clone().unwrap_or_else(|| {
+        log::error!("interface_name not set in config");
+        exit(EPERM);
+    });
 
     #[cfg(target_os = "macos")]
     let use_vpn_dns = conf.use_vpn_dns.unwrap_or(false);
@@ -98,7 +605,9 @@ async fn main() {
                     resp.domain
                 );
                 conf.server = Some(resp.domain);
-                conf.save().await;
+                if let Err(e) = conf.save().await {
+                    log::warn!("failed to save config: {}", e);
+                }
             }
             Err(err) => {
                 log::error!(
@@ -112,14 +621,23 @@ async fn main() {
     }
 
     let with_wg_log = conf.debug_wg.unwrap_or_default();
-    let mut c = Client::new(conf).unwrap();
+    let mut c = match Client::new(conf) {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("failed to initialize client: {}", e);
+            exit(EPERM);
+        }
+    };
     let mut logout_retry = true;
     let wg_conf: Option<WgConf>;
 
     loop {
         if c.need_login() {
             log::info!("not login yet, try to login");
-            c.login().await.unwrap();
+            if let Err(e) = c.login().await {
+                log::error!("login failed: {}", e);
+                exit(EPERM);
+            }
             log::info!("login success");
         }
         log::info!("try to connect");
@@ -130,17 +648,17 @@ async fn main() {
             }
             Err(e) => {
                 if logout_retry && e.to_string().contains("logout") {
-                    // e contains detail message, so just print it out
                     log::warn!("{}", e);
                     logout_retry = false;
                     continue;
                 } else {
-                    panic!("{}", e);
+                    log::error!("connect failed: {}", e);
+                    exit(EPERM);
                 }
             }
         };
     }
-    let wg_conf = wg_conf.unwrap();
+    let wg_conf = wg_conf.expect("unreachable: loop above guarantees wg_conf is Some");
 
     if let Some(peer_ip) = extract_peer_host(&wg_conf.peer_address) {
         if let Err(err) = c.ensure_peer_route(&peer_ip).await {
@@ -158,7 +676,11 @@ async fn main() {
     match uapi.config_wg(&wg_conf).await {
         Ok(_) => {}
         Err(err) => {
-            log::error!("failed to config interface with uapi for {}: {}", name, err);
+            log::error!(
+                "failed to config interface with uapi for {}: {}",
+                name,
+                err
+            );
             exit(EPERM);
         }
     }
@@ -179,23 +701,20 @@ async fn main() {
 
     let mut exit_code = 0;
     tokio::select! {
-        // handle signal
         _ = async {
             match tokio::signal::ctrl_c().await {
                 Ok(_) => {},
                 Err(e) => {
-                    log::warn!("failed to receive signal: {}",e);
+                    log::warn!("failed to receive signal: {}", e);
                 },
             }
-            log::info!("ctrl+v received");
+            log::info!("ctrl+c received");
         } => {},
 
-        // keep alive
         _ = c.keep_alive_vpn(&wg_conf, 60) => {
             exit_code = ETIMEDOUT;
         },
 
-        // check wg handshake and exit if timeout
         _ = async {
             uapi.check_wg_connection().await;
             log::warn!("last handshake timeout");
@@ -204,15 +723,13 @@ async fn main() {
         },
     }
 
-    // shutdown
+    // shutdown — same order as daemon: stop WireGuard first to restore network.
     log::info!("disconnecting vpn...");
-    match c.disconnect_vpn(&wg_conf).await {
-        Ok(_) => {}
-        Err(e) => log::warn!("failed to disconnect vpn: {}", e),
-    };
 
+    // 1. Stop WireGuard — destroys TUN, removes VPN routes.
     wg::stop_wg_go();
 
+    // 2. Restore DNS.
     #[cfg(target_os = "macos")]
     if use_vpn_dns {
         match dns_manager.restore_dns() {
@@ -221,6 +738,26 @@ async fn main() {
                 log::warn!("failed to delete dns: {}", err);
             }
         }
+    }
+
+    // 3. Remove peer host route.
+    #[cfg(target_os = "macos")]
+    if let Some(peer_ip) = extract_peer_host(&wg_conf.peer_address) {
+        let _ = std::process::Command::new("route")
+            .args(["-n", "delete", "-host", &peer_ip])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
+    // 4. Notify server (best effort).
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        c.disconnect_vpn(&wg_conf),
+    ).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => log::warn!("failed to disconnect vpn: {}", e),
+        Err(_) => log::warn!("disconnect_vpn timed out"),
     }
 
     log::info!("reach exit");
@@ -248,4 +785,254 @@ fn print_version() {
     let pkg_name = env!("CARGO_PKG_NAME");
     let pkg_version = env!("CARGO_PKG_VERSION");
     log::info!("running {}@{}", pkg_name, pkg_version);
+}
+
+// ---------------------------------------------------------------------------
+// `corplink update` — self-update from GitHub releases
+// ---------------------------------------------------------------------------
+
+const GITHUB_REPO: &str = "cyhhao/corplink-rs";
+
+/// Normalise a version tag: strip leading `v` and trailing `.0` patch if
+/// the release uses MAJOR.MINOR while Cargo uses MAJOR.MINOR.PATCH.
+fn normalize_version(v: &str) -> String {
+    v.trim().trim_start_matches('v').to_string()
+}
+
+/// Return the expected asset filename suffix for the current platform.
+fn platform_asset_suffix() -> Option<(&'static str, &'static str)> {
+    let os = if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        return None;
+    };
+
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        other => other,
+    };
+
+    Some((os, arch))
+}
+
+async fn cmd_update(check_only: bool) {
+    let current_version = env!("CARGO_PKG_VERSION");
+    println!("current version: {}", current_version);
+
+    // 1. Fetch latest release from GitHub API.
+    let api_url = format!(
+        "https://api.github.com/repos/{}/releases/latest",
+        GITHUB_REPO
+    );
+    let http = reqwest::Client::builder()
+        .user_agent("corplink-updater")
+        .build()
+        .expect("failed to build HTTP client");
+
+    let resp = match http.get(&api_url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("failed to query GitHub releases: {}", e);
+            exit(EPERM);
+        }
+    };
+
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        println!("no releases found on {}", GITHUB_REPO);
+        return;
+    }
+    if !resp.status().is_success() {
+        eprintln!("GitHub API returned {}", resp.status());
+        exit(EPERM);
+    }
+
+    let release: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("failed to parse release JSON: {}", e);
+            exit(EPERM);
+        }
+    };
+
+    let tag = release["tag_name"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let latest = normalize_version(&tag);
+    let current = normalize_version(current_version);
+
+    println!("latest release:  {} (tag: {})", latest, tag);
+
+    // 2. Compare versions.
+    if latest == current
+        || latest == current.trim_end_matches(".0")
+        || current == latest.clone() + ".0"
+    {
+        println!("already up to date.");
+        return;
+    }
+
+    if check_only {
+        println!("update available: {} -> {}", current, latest);
+        return;
+    }
+
+    println!("updating {} -> {} ...", current, latest);
+
+    // 3. Find the matching asset for this platform.
+    let (os, arch) = match platform_asset_suffix() {
+        Some(pair) => pair,
+        None => {
+            eprintln!("unsupported platform");
+            exit(EPERM);
+        }
+    };
+
+    let assets = match release["assets"].as_array() {
+        Some(a) => a,
+        None => {
+            eprintln!("no assets in release");
+            exit(EPERM);
+        }
+    };
+
+    let asset_pattern = format!("{}-{}", os, arch);
+    let asset = assets.iter().find(|a| {
+        a["name"]
+            .as_str()
+            .map_or(false, |n| n.contains(&asset_pattern))
+    });
+
+    let asset = match asset {
+        Some(a) => a,
+        None => {
+            eprintln!(
+                "no asset found for {}-{} in release {}",
+                os, arch, tag
+            );
+            eprintln!("available assets:");
+            for a in assets {
+                if let Some(name) = a["name"].as_str() {
+                    eprintln!("  {}", name);
+                }
+            }
+            exit(EPERM);
+        }
+    };
+
+    let download_url = asset["browser_download_url"]
+        .as_str()
+        .expect("asset has no download URL");
+    let asset_name = asset["name"].as_str().unwrap_or("update");
+
+    println!("downloading {} ...", asset_name);
+
+    // 4. Download the asset.
+    let resp = match http.get(download_url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("download failed: {}", e);
+            exit(EPERM);
+        }
+    };
+    if !resp.status().is_success() {
+        eprintln!("download returned {}", resp.status());
+        exit(EPERM);
+    }
+
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("failed to read download body: {}", e);
+            exit(EPERM);
+        }
+    };
+
+    let tmp_dir = std::env::temp_dir().join("corplink-update");
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).expect("failed to create temp dir");
+
+    let archive_path = tmp_dir.join(asset_name);
+    std::fs::write(&archive_path, &bytes).expect("failed to write downloaded archive");
+
+    // 5. Extract the archive.
+    println!("extracting ...");
+    let extract_ok = if asset_name.ends_with(".tar.gz") || asset_name.ends_with(".tgz") {
+        std::process::Command::new("tar")
+            .args(["-xzf", &archive_path.to_string_lossy()])
+            .current_dir(&tmp_dir)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    } else if asset_name.ends_with(".zip") {
+        std::process::Command::new("unzip")
+            .args(["-o", &archive_path.to_string_lossy()])
+            .current_dir(&tmp_dir)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    } else {
+        eprintln!("unknown archive format: {}", asset_name);
+        exit(EPERM);
+    };
+
+    if !extract_ok {
+        eprintln!("failed to extract archive");
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        exit(EPERM);
+    }
+
+    // 6. Locate the new binary (could be named `corplink-rs` or `corplink`).
+    let new_binary = ["corplink-rs", "corplink"]
+        .iter()
+        .map(|name| tmp_dir.join(name))
+        .find(|p| p.exists());
+
+    let new_binary = match new_binary {
+        Some(p) => p,
+        None => {
+            eprintln!("binary not found in extracted archive");
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            exit(EPERM);
+        }
+    };
+
+    // 7. Replace the current executable.
+    let current_exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("cannot determine current executable path: {}", e);
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            exit(EPERM);
+        }
+    };
+
+    // Set executable permission on the new binary.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&new_binary, std::fs::Permissions::from_mode(0o755));
+    }
+
+    // On Unix, we can atomically replace a running binary via rename.
+    // If cross-device, fall back to copy.
+    println!("installing to {} ...", current_exe.display());
+    if std::fs::rename(&new_binary, &current_exe).is_err() {
+        if let Err(e) = std::fs::copy(&new_binary, &current_exe) {
+            eprintln!("failed to install new binary: {}", e);
+            eprintln!("you may need to run with sudo or copy manually:");
+            eprintln!("  sudo cp {} {}", new_binary.display(), current_exe.display());
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            exit(EPERM);
+        }
+    }
+
+    // 8. Cleanup.
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+
+    println!("updated to {} successfully!", latest);
 }

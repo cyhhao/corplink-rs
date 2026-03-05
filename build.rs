@@ -1,6 +1,7 @@
 use bindgen::callbacks::{IntKind, ParseCallbacks};
 use std::env;
 use std::path::PathBuf;
+use std::process::Command;
 
 #[derive(Debug)]
 struct DefineParser;
@@ -16,6 +17,15 @@ impl ParseCallbacks for DefineParser {
 }
 
 fn main() {
+    // -----------------------------------------------------------------------
+    // 1. Build frontend (optional — skip if SKIP_FRONTEND=1 or npm not found)
+    // -----------------------------------------------------------------------
+    build_frontend();
+
+    // -----------------------------------------------------------------------
+    // 2. WireGuard C library bindings (existing logic)
+    // -----------------------------------------------------------------------
+
     // Tell cargo to look for shared libraries in the specified directory
     println!("cargo:rustc-link-search=./libwg");
 
@@ -47,4 +57,57 @@ fn main() {
     bindings
         .write_to_file(out_path.join("bindings.rs"))
         .expect("Couldn't write bindings!");
+}
+
+fn build_frontend() {
+    // Skip if SKIP_FRONTEND=1
+    if env::var("SKIP_FRONTEND").unwrap_or_default() == "1" {
+        println!("cargo:warning=Skipping frontend build (SKIP_FRONTEND=1)");
+        return;
+    }
+
+    let web_dir = PathBuf::from("web");
+    if !web_dir.join("package.json").exists() {
+        println!("cargo:warning=web/package.json not found, skipping frontend build");
+        return;
+    }
+
+    // Rerun if frontend source changes
+    println!("cargo:rerun-if-changed=web/src/");
+    println!("cargo:rerun-if-changed=web/index.html");
+    println!("cargo:rerun-if-changed=web/package.json");
+    println!("cargo:rerun-if-changed=web/vite.config.ts");
+
+    // Install deps if node_modules missing
+    if !web_dir.join("node_modules").exists() {
+        let status = Command::new("npm")
+            .args(["install"])
+            .current_dir(&web_dir)
+            .status();
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(s) => {
+                println!("cargo:warning=npm install failed with {}", s);
+                return;
+            }
+            Err(e) => {
+                println!(
+                    "cargo:warning=npm not found, skipping frontend build: {}",
+                    e
+                );
+                return;
+            }
+        }
+    }
+
+    // Build
+    let status = Command::new("npm")
+        .args(["run", "build"])
+        .current_dir(&web_dir)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => println!("cargo:warning=frontend build failed with {}", s),
+        Err(e) => println!("cargo:warning=failed to run npm build: {}", e),
+    }
 }
