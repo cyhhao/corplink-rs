@@ -48,14 +48,88 @@ pub fn build_router(state: AppState, port: u16) -> Router {
 }
 
 /// Start the web server on the given port.
-pub async fn serve(state: AppState, port: u16) -> Result<(), Box<dyn std::error::Error>> {
+///
+/// On shutdown (SIGINT / SIGTERM), any running daemon child process is
+/// killed so that VPN routes and DNS are not left behind.
+pub async fn serve(
+    state: AppState,
+    port: u16,
+    state_for_shutdown: AppState,
+) -> Result<(), Box<dyn std::error::Error>> {
     let app = build_router(state, port);
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     log::info!("web UI listening on http://{}", addr);
 
+    let shutdown = async move {
+        // Wait for SIGINT (Ctrl+C) or SIGTERM.
+        let ctrl_c = tokio::signal::ctrl_c();
+        #[cfg(unix)]
+        let mut sigterm = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        )
+        .expect("failed to register SIGTERM handler");
+
+        #[cfg(unix)]
+        tokio::select! {
+            _ = ctrl_c => { log::info!("received SIGINT, shutting down..."); }
+            _ = sigterm.recv() => { log::info!("received SIGTERM, shutting down..."); }
+        }
+        #[cfg(not(unix))]
+        {
+            ctrl_c.await.ok();
+            log::info!("received SIGINT, shutting down...");
+        }
+
+        // Kill the daemon child process if it is still running.
+        kill_daemon(&state_for_shutdown).await;
+    };
+
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await?;
     Ok(())
+}
+
+/// Request daemon shutdown via sentinel file, then wait for it to exit.
+///
+/// Note: we cannot use `libc::kill()` because the parent runs as a normal
+/// user while the daemon runs as root — the kernel returns EPERM.
+/// Ctrl+C in a terminal works because the TTY driver bypasses UID checks
+/// when sending SIGINT to the foreground process group.
+async fn kill_daemon(state: &AppState) {
+    let (has_daemon, tmp_dir) = {
+        let inner = state.lock().await;
+        (inner.daemon_pid.is_some(), inner.daemon_tmp_dir.clone())
+    };
+    if !has_daemon {
+        return;
+    }
+
+    // Create the shutdown sentinel file.
+    if let Some(ref dir) = tmp_dir {
+        let shutdown_file = dir.join("shutdown");
+        match std::fs::write(&shutdown_file, b"") {
+            Ok(_) => log::info!("created shutdown sentinel: {}", shutdown_file.display()),
+            Err(e) => log::warn!("failed to create shutdown sentinel: {}", e),
+        }
+    }
+
+    // Give the daemon a few seconds to detect the file and clean up.
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(5);
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let inner = state.lock().await;
+        if inner.daemon_pid.is_none() {
+            log::info!("daemon exited cleanly");
+            return;
+        }
+        if start.elapsed() > timeout {
+            break;
+        }
+    }
+    log::warn!("daemon did not exit within {:?} of shutdown request", timeout);
 }
 
 #[cfg(test)]

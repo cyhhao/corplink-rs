@@ -45,6 +45,13 @@ pub enum Command {
         config: String,
     },
 
+    /// Check for updates and self-update from GitHub releases
+    Update {
+        /// Only check, don't actually update
+        #[arg(long)]
+        check: bool,
+    },
+
     /// (Internal) Privileged VPN daemon — spawned by `serve` via sudo
     #[command(name = "connect-daemon", hide = true)]
     ConnectDaemon {

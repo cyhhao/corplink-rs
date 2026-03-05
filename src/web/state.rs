@@ -79,6 +79,8 @@ pub struct AppStateInner {
     pub active_profile: Option<String>,
     /// PID of the privileged connect-daemon child process.
     pub daemon_pid: Option<u32>,
+    /// Temp directory holding the event pipe and shutdown sentinel.
+    pub daemon_tmp_dir: Option<std::path::PathBuf>,
     pub vpn_ip: Option<String>,
     pub peer_address: Option<String>,
     pub connected_since: Option<chrono::DateTime<chrono::Utc>>,
@@ -106,6 +108,7 @@ impl AppStateInner {
     /// Reset all connection-related fields to their disconnected defaults.
     pub fn reset_connection(&mut self) {
         self.daemon_pid = None;
+        self.daemon_tmp_dir = None;
         self.vpn_ip = None;
         self.peer_address = None;
         self.connected_since = None;
@@ -122,6 +125,7 @@ pub fn new_app_state(profiles_dir: std::path::PathBuf) -> AppState {
         status: VpnStatus::Disconnected,
         active_profile: None,
         daemon_pid: None,
+        daemon_tmp_dir: None,
         vpn_ip: None,
         peer_address: None,
         connected_since: None,

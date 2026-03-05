@@ -459,6 +459,23 @@ fn create_event_pipe() -> Result<(std::path::PathBuf, std::path::PathBuf), Strin
     Ok((tmp_dir, pipe_path))
 }
 
+/// Request the daemon to shut down by creating a sentinel file.
+///
+/// The daemon (running as root) polls for this file every 500 ms.
+/// We use a file instead of Unix signals because a non-root parent
+/// process cannot send signals to a root child (EPERM).
+fn request_daemon_shutdown(tmp_dir: &Option<std::path::PathBuf>) {
+    if let Some(ref dir) = tmp_dir {
+        let shutdown_file = dir.join("shutdown");
+        match std::fs::write(&shutdown_file, b"") {
+            Ok(_) => log::info!("created shutdown sentinel: {}", shutdown_file.display()),
+            Err(e) => log::warn!("failed to create shutdown sentinel: {}", e),
+        }
+    } else {
+        log::warn!("no daemon tmp_dir — cannot create shutdown sentinel");
+    }
+}
+
 /// Build the privileged command for the connect-daemon.
 ///
 /// On macOS, uses `sudo` which triggers Touch ID via `pam_tid.so`
@@ -600,6 +617,7 @@ async fn do_connect(state: AppState, config_path: &str) -> Result<(), String> {
                         handle.block_on(async {
                             let mut inner = state.lock().await;
                             inner.daemon_pid = Some(pid);
+                            inner.daemon_tmp_dir = Some(tmp_dir_for_cleanup.clone());
                         });
                         log::info!("daemon started with pid {}", pid);
                     }
@@ -664,13 +682,13 @@ async fn do_connect(state: AppState, config_path: &str) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-// POST /api/disconnect — send SIGTERM to the daemon child
+// POST /api/disconnect — request daemon shutdown via sentinel file
 // ---------------------------------------------------------------------------
 
 pub async fn disconnect(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<ApiResponse<ConnectionInfo>>) {
-    let daemon_pid = {
+    let (daemon_pid, tmp_dir) = {
         let mut inner = state.lock().await;
         match inner.status {
             VpnStatus::Connected | VpnStatus::Error => {}
@@ -682,18 +700,22 @@ pub async fn disconnect(
             }
         }
         inner.status = VpnStatus::Disconnecting;
-        inner.daemon_pid
+        (inner.daemon_pid, inner.daemon_tmp_dir.clone())
     };
 
-    if let Some(pid) = daemon_pid {
-        #[cfg(unix)]
-        unsafe {
-            libc::kill(pid as i32, libc::SIGTERM);
-        }
-        log::info!("sent SIGTERM to daemon pid {}", pid);
+    if daemon_pid.is_some() {
+        // Signal the daemon to shut down by creating a sentinel file.
+        // We cannot use libc::kill() because the daemon runs as root and
+        // we are a normal user — the kernel would return EPERM.
+        request_daemon_shutdown(&tmp_dir);
 
-        // Wait for daemon to exit gracefully; fall back to SIGKILL.
-        let grace = std::time::Duration::from_secs(5);
+        // Wait for daemon to exit gracefully.  The daemon cleanup order is:
+        //   1. stop_wg_go (instant — destroys TUN, removes routes)
+        //   2. restore_dns (fast)
+        //   3. delete peer route (fast)
+        //   4. disconnect_vpn API call (up to 3s timeout)
+        // Total expected: <5s.  Allow up to 8s before giving up.
+        let grace = std::time::Duration::from_secs(8);
         let start = std::time::Instant::now();
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -702,13 +724,7 @@ pub async fn disconnect(
                 break;
             }
             if start.elapsed() > grace {
-                log::warn!("daemon did not exit after {:?}, sending SIGKILL", grace);
-                #[cfg(unix)]
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGKILL);
-                }
-                drop(inner);
-                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                log::warn!("daemon did not exit after {:?}", grace);
                 break;
             }
         }
@@ -812,23 +828,25 @@ pub async fn reconnect(
     }
 
     // Kill current daemon.
-    let daemon_pid = {
+    let tmp_dir = {
         let mut inner = state.lock().await;
         inner.status = VpnStatus::Connecting;
         inner.last_error = None;
-        inner.daemon_pid
+        inner.daemon_tmp_dir.clone()
     };
 
-    if let Some(pid) = daemon_pid {
-        #[cfg(unix)]
-        unsafe {
-            libc::kill(pid as i32, libc::SIGTERM);
-        }
+    if tmp_dir.is_some() {
+        request_daemon_shutdown(&tmp_dir);
         // Wait for daemon to fully exit (reader task resets daemon_pid).
-        for _ in 0..50 {
+        let start = std::time::Instant::now();
+        loop {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             let inner = state.lock().await;
             if inner.daemon_pid.is_none() {
+                break;
+            }
+            if start.elapsed() > std::time::Duration::from_secs(8) {
+                log::warn!("reconnect: daemon did not exit after 8s");
                 break;
             }
         }

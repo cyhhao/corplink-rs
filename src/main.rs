@@ -153,6 +153,7 @@ async fn main() {
         // Read-only commands — no privileges needed.
         Command::Status { port } => cmd_status(port).await,
         Command::Profiles => cmd_profiles(),
+        Command::Update { check } => cmd_update(check).await,
     }
 }
 
@@ -177,7 +178,9 @@ async fn cmd_serve(port: u16, no_open: bool) {
     }
 
     log::info!("starting web UI on port {}", port);
-    if let Err(e) = web::serve(state, port).await {
+
+    let state_for_shutdown = state.clone();
+    if let Err(e) = web::serve(state, port, state_for_shutdown).await {
         log::error!("web server error: {}", e);
         exit(EPERM);
     }
@@ -347,7 +350,16 @@ async fn cmd_connect_daemon(config_path: &str, event_pipe_path: &str, owner_uid:
         "use_full_route": use_full_route,
     }));
 
-    // ── Keep alive until signal or timeout ───────────────────────────────
+    // ── Keep alive until signal, timeout, or shutdown request ────────────
+    //
+    // The parent process (corplink serve) cannot send Unix signals to us
+    // because we run as root and it runs as a normal user.  Instead, it
+    // creates a "shutdown" file in the temp directory to request disconnect.
+    // We poll for that file every 500 ms.
+    let shutdown_file = std::path::Path::new(event_pipe_path)
+        .parent()
+        .map(|d| d.join("shutdown"));
+
     let disconnect_reason;
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
@@ -366,6 +378,21 @@ async fn cmd_connect_daemon(config_path: &str, event_pipe_path: &str, owner_uid:
         } => {
             disconnect_reason = "signal";
         }
+        _ = async {
+            if let Some(ref path) = shutdown_file {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    if path.exists() {
+                        log::info!("shutdown file detected: {}", path.display());
+                        break;
+                    }
+                }
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {
+            disconnect_reason = "shutdown_requested";
+        }
         _ = c.keep_alive_vpn(&wg_conf, 60) => {
             disconnect_reason = "keepalive_timeout";
         }
@@ -377,13 +404,42 @@ async fn cmd_connect_daemon(config_path: &str, event_pipe_path: &str, owner_uid:
     }
 
     // ── Cleanup ─────────────────────────────────────────────────────────
+    // Order matters: stop WireGuard first so routes are removed and the
+    // user's network is restored immediately.  DNS and API notification
+    // happen afterwards over the normal (non-VPN) network.
     log::info!("disconnecting vpn (reason: {})...", disconnect_reason);
-    let _ = c.disconnect_vpn(&wg_conf).await;
-    wg::stop_wg_go();
 
+    // 1. Stop WireGuard — destroys TUN interface and removes all VPN routes.
+    wg::stop_wg_go();
+    log::info!("wireguard stopped, TUN interface destroyed");
+
+    // 2. Restore DNS.
     #[cfg(target_os = "macos")]
     if use_vpn_dns {
-        let _ = dns_manager.restore_dns();
+        if let Err(e) = dns_manager.restore_dns() {
+            log::warn!("failed to restore dns: {}", e);
+        }
+    }
+
+    // 3. Remove the peer host route added by ensure_peer_route().
+    #[cfg(target_os = "macos")]
+    if let Some(peer_ip) = extract_peer_host(&wg_conf.peer_address) {
+        let _ = std::process::Command::new("route")
+            .args(["-n", "delete", "-host", &peer_ip])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        log::debug!("removed peer host route for {}", peer_ip);
+    }
+
+    // 4. Notify server (best effort, with timeout — network is normal now).
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        c.disconnect_vpn(&wg_conf),
+    ).await {
+        Ok(Ok(())) => log::info!("server notified of disconnect"),
+        Ok(Err(e)) => log::warn!("disconnect_vpn API failed: {}", e),
+        Err(_) => log::warn!("disconnect_vpn API timed out after 3s"),
     }
 
     emit!(serde_json::json!({"event": "disconnected", "reason": disconnect_reason}));
@@ -667,15 +723,13 @@ async fn run_legacy_flow(conf_file: &str) {
         },
     }
 
-    // shutdown
+    // shutdown — same order as daemon: stop WireGuard first to restore network.
     log::info!("disconnecting vpn...");
-    match c.disconnect_vpn(&wg_conf).await {
-        Ok(_) => {}
-        Err(e) => log::warn!("failed to disconnect vpn: {}", e),
-    };
 
+    // 1. Stop WireGuard — destroys TUN, removes VPN routes.
     wg::stop_wg_go();
 
+    // 2. Restore DNS.
     #[cfg(target_os = "macos")]
     if use_vpn_dns {
         match dns_manager.restore_dns() {
@@ -684,6 +738,26 @@ async fn run_legacy_flow(conf_file: &str) {
                 log::warn!("failed to delete dns: {}", err);
             }
         }
+    }
+
+    // 3. Remove peer host route.
+    #[cfg(target_os = "macos")]
+    if let Some(peer_ip) = extract_peer_host(&wg_conf.peer_address) {
+        let _ = std::process::Command::new("route")
+            .args(["-n", "delete", "-host", &peer_ip])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
+    // 4. Notify server (best effort).
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        c.disconnect_vpn(&wg_conf),
+    ).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => log::warn!("failed to disconnect vpn: {}", e),
+        Err(_) => log::warn!("disconnect_vpn timed out"),
     }
 
     log::info!("reach exit");
@@ -711,4 +785,254 @@ fn print_version() {
     let pkg_name = env!("CARGO_PKG_NAME");
     let pkg_version = env!("CARGO_PKG_VERSION");
     log::info!("running {}@{}", pkg_name, pkg_version);
+}
+
+// ---------------------------------------------------------------------------
+// `corplink update` — self-update from GitHub releases
+// ---------------------------------------------------------------------------
+
+const GITHUB_REPO: &str = "cyhhao/corplink-rs";
+
+/// Normalise a version tag: strip leading `v` and trailing `.0` patch if
+/// the release uses MAJOR.MINOR while Cargo uses MAJOR.MINOR.PATCH.
+fn normalize_version(v: &str) -> String {
+    v.trim().trim_start_matches('v').to_string()
+}
+
+/// Return the expected asset filename suffix for the current platform.
+fn platform_asset_suffix() -> Option<(&'static str, &'static str)> {
+    let os = if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        return None;
+    };
+
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        other => other,
+    };
+
+    Some((os, arch))
+}
+
+async fn cmd_update(check_only: bool) {
+    let current_version = env!("CARGO_PKG_VERSION");
+    println!("current version: {}", current_version);
+
+    // 1. Fetch latest release from GitHub API.
+    let api_url = format!(
+        "https://api.github.com/repos/{}/releases/latest",
+        GITHUB_REPO
+    );
+    let http = reqwest::Client::builder()
+        .user_agent("corplink-updater")
+        .build()
+        .expect("failed to build HTTP client");
+
+    let resp = match http.get(&api_url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("failed to query GitHub releases: {}", e);
+            exit(EPERM);
+        }
+    };
+
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        println!("no releases found on {}", GITHUB_REPO);
+        return;
+    }
+    if !resp.status().is_success() {
+        eprintln!("GitHub API returned {}", resp.status());
+        exit(EPERM);
+    }
+
+    let release: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("failed to parse release JSON: {}", e);
+            exit(EPERM);
+        }
+    };
+
+    let tag = release["tag_name"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let latest = normalize_version(&tag);
+    let current = normalize_version(current_version);
+
+    println!("latest release:  {} (tag: {})", latest, tag);
+
+    // 2. Compare versions.
+    if latest == current
+        || latest == current.trim_end_matches(".0")
+        || current == latest.clone() + ".0"
+    {
+        println!("already up to date.");
+        return;
+    }
+
+    if check_only {
+        println!("update available: {} -> {}", current, latest);
+        return;
+    }
+
+    println!("updating {} -> {} ...", current, latest);
+
+    // 3. Find the matching asset for this platform.
+    let (os, arch) = match platform_asset_suffix() {
+        Some(pair) => pair,
+        None => {
+            eprintln!("unsupported platform");
+            exit(EPERM);
+        }
+    };
+
+    let assets = match release["assets"].as_array() {
+        Some(a) => a,
+        None => {
+            eprintln!("no assets in release");
+            exit(EPERM);
+        }
+    };
+
+    let asset_pattern = format!("{}-{}", os, arch);
+    let asset = assets.iter().find(|a| {
+        a["name"]
+            .as_str()
+            .map_or(false, |n| n.contains(&asset_pattern))
+    });
+
+    let asset = match asset {
+        Some(a) => a,
+        None => {
+            eprintln!(
+                "no asset found for {}-{} in release {}",
+                os, arch, tag
+            );
+            eprintln!("available assets:");
+            for a in assets {
+                if let Some(name) = a["name"].as_str() {
+                    eprintln!("  {}", name);
+                }
+            }
+            exit(EPERM);
+        }
+    };
+
+    let download_url = asset["browser_download_url"]
+        .as_str()
+        .expect("asset has no download URL");
+    let asset_name = asset["name"].as_str().unwrap_or("update");
+
+    println!("downloading {} ...", asset_name);
+
+    // 4. Download the asset.
+    let resp = match http.get(download_url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("download failed: {}", e);
+            exit(EPERM);
+        }
+    };
+    if !resp.status().is_success() {
+        eprintln!("download returned {}", resp.status());
+        exit(EPERM);
+    }
+
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("failed to read download body: {}", e);
+            exit(EPERM);
+        }
+    };
+
+    let tmp_dir = std::env::temp_dir().join("corplink-update");
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).expect("failed to create temp dir");
+
+    let archive_path = tmp_dir.join(asset_name);
+    std::fs::write(&archive_path, &bytes).expect("failed to write downloaded archive");
+
+    // 5. Extract the archive.
+    println!("extracting ...");
+    let extract_ok = if asset_name.ends_with(".tar.gz") || asset_name.ends_with(".tgz") {
+        std::process::Command::new("tar")
+            .args(["-xzf", &archive_path.to_string_lossy()])
+            .current_dir(&tmp_dir)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    } else if asset_name.ends_with(".zip") {
+        std::process::Command::new("unzip")
+            .args(["-o", &archive_path.to_string_lossy()])
+            .current_dir(&tmp_dir)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    } else {
+        eprintln!("unknown archive format: {}", asset_name);
+        exit(EPERM);
+    };
+
+    if !extract_ok {
+        eprintln!("failed to extract archive");
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        exit(EPERM);
+    }
+
+    // 6. Locate the new binary (could be named `corplink-rs` or `corplink`).
+    let new_binary = ["corplink-rs", "corplink"]
+        .iter()
+        .map(|name| tmp_dir.join(name))
+        .find(|p| p.exists());
+
+    let new_binary = match new_binary {
+        Some(p) => p,
+        None => {
+            eprintln!("binary not found in extracted archive");
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            exit(EPERM);
+        }
+    };
+
+    // 7. Replace the current executable.
+    let current_exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("cannot determine current executable path: {}", e);
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            exit(EPERM);
+        }
+    };
+
+    // Set executable permission on the new binary.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&new_binary, std::fs::Permissions::from_mode(0o755));
+    }
+
+    // On Unix, we can atomically replace a running binary via rename.
+    // If cross-device, fall back to copy.
+    println!("installing to {} ...", current_exe.display());
+    if std::fs::rename(&new_binary, &current_exe).is_err() {
+        if let Err(e) = std::fs::copy(&new_binary, &current_exe) {
+            eprintln!("failed to install new binary: {}", e);
+            eprintln!("you may need to run with sudo or copy manually:");
+            eprintln!("  sudo cp {} {}", new_binary.display(), current_exe.display());
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            exit(EPERM);
+        }
+    }
+
+    // 8. Cleanup.
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+
+    println!("updated to {} successfully!", latest);
 }
