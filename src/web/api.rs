@@ -762,7 +762,7 @@ pub struct VersionInfo {
 pub async fn get_version() -> (StatusCode, Json<ApiResponse<VersionInfo>>) {
     ok_json(VersionInfo {
         name: env!("CARGO_PKG_NAME"),
-        version: env!("CARGO_PKG_VERSION"),
+        version: env!("BUILD_VERSION"),
     })
 }
 

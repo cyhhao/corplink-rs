@@ -18,7 +18,12 @@ impl ParseCallbacks for DefineParser {
 
 fn main() {
     // -----------------------------------------------------------------------
-    // 1. Build frontend (optional — skip if SKIP_FRONTEND=1 or npm not found)
+    // 1. Derive BUILD_VERSION from git tag (falls back to CARGO_PKG_VERSION)
+    // -----------------------------------------------------------------------
+    emit_build_version();
+
+    // -----------------------------------------------------------------------
+    // 2. Build frontend (optional — skip if SKIP_FRONTEND=1 or npm not found)
     // -----------------------------------------------------------------------
     build_frontend();
 
@@ -57,6 +62,36 @@ fn main() {
     bindings
         .write_to_file(out_path.join("bindings.rs"))
         .expect("Couldn't write bindings!");
+}
+
+/// Emit `BUILD_VERSION` as a compile-time env var.
+///
+/// - On a tagged commit (CI release): uses the git tag (e.g. `v5.2.0` → `5.2.0`)
+/// - Otherwise (local dev build): falls back to `CARGO_PKG_VERSION`
+///
+/// This lets the binary report the release version without manually syncing
+/// Cargo.toml on every tag push.
+fn emit_build_version() {
+    // Rerun when HEAD changes (new commit, checkout, tag).
+    println!("cargo:rerun-if-changed=.git/HEAD");
+
+    let version = Command::new("git")
+        .args(["describe", "--tags", "--exact-match"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            let tag = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if tag.is_empty() {
+                None
+            } else {
+                // Strip leading 'v' so "v5.2.0" becomes "5.2.0"
+                Some(tag.trim_start_matches('v').to_string())
+            }
+        })
+        .unwrap_or_else(|| env::var("CARGO_PKG_VERSION").unwrap());
+
+    println!("cargo:rustc-env=BUILD_VERSION={}", version);
 }
 
 fn build_frontend() {

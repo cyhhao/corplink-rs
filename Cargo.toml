@@ -1,6 +1,6 @@
 [package]
 name = "corplink"
-version = "0.6.0"
+version = "5.2.0"
 edition = "2021"
 
 [[bin]]

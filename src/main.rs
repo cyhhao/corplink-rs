@@ -783,7 +783,7 @@ fn check_privilege() {
 
 fn print_version() {
     let pkg_name = env!("CARGO_PKG_NAME");
-    let pkg_version = env!("CARGO_PKG_VERSION");
+    let pkg_version = env!("BUILD_VERSION");
     log::info!("running {}@{}", pkg_name, pkg_version);
 }
 
@@ -820,7 +820,7 @@ fn platform_asset_suffix() -> Option<(&'static str, &'static str)> {
 }
 
 async fn cmd_update(check_only: bool) {
-    let current_version = env!("CARGO_PKG_VERSION");
+    let current_version = env!("BUILD_VERSION");
     println!("current version: {}", current_version);
 
     // 1. Fetch latest release from GitHub API.
@@ -868,10 +868,7 @@ async fn cmd_update(check_only: bool) {
     println!("latest release:  {} (tag: {})", latest, tag);
 
     // 2. Compare versions.
-    if latest == current
-        || latest == current.trim_end_matches(".0")
-        || current == latest.clone() + ".0"
-    {
+    if latest == current {
         println!("already up to date.");
         return;
     }
