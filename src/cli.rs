@@ -12,7 +12,32 @@ pub const DEFAULT_PORT: u16 = 4027;
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Start the daemon and open the web management UI (default)
+    /// Start the daemon in the background and open the web UI (default)
+    Start {
+        /// Port for the web UI
+        #[arg(short, long, default_value_t = DEFAULT_PORT)]
+        port: u16,
+
+        /// Don't open the browser automatically
+        #[arg(long)]
+        no_open: bool,
+    },
+
+    /// Stop the background daemon
+    Stop,
+
+    /// Restart the background daemon
+    Restart {
+        /// Port for the web UI
+        #[arg(short, long, default_value_t = DEFAULT_PORT)]
+        port: u16,
+
+        /// Don't open the browser automatically
+        #[arg(long)]
+        no_open: bool,
+    },
+
+    /// Run the web server in the foreground (for debugging)
     Serve {
         /// Port for the web UI
         #[arg(short, long, default_value_t = DEFAULT_PORT)]
@@ -72,7 +97,7 @@ pub enum Command {
 
 impl Default for Command {
     fn default() -> Self {
-        Command::Serve {
+        Command::Start {
             port: DEFAULT_PORT,
             no_open: false,
         }

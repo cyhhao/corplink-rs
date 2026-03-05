@@ -101,6 +101,126 @@ pub(crate) fn cookies_dir() -> PathBuf {
     dir
 }
 
+// ---------------------------------------------------------------------------
+// PID file management — tracks the background daemon process
+//
+// Uses `flock(2)` as the authoritative "is daemon alive?" check, which is
+// immune to PID reuse after crashes.  The daemon (`cmd_serve`) holds an
+// exclusive lock on the PID file for its entire lifetime.
+// ---------------------------------------------------------------------------
+
+/// Path to the PID file: `~/.config/corplink/daemon.pid`.
+fn pid_file_path() -> PathBuf {
+    config_dir().join("daemon.pid")
+}
+
+/// Read the PID recorded in the PID file, rejecting obviously invalid values.
+fn read_daemon_pid() -> Option<u32> {
+    std::fs::read_to_string(pid_file_path())
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .filter(|&pid| pid > 1) // 0 ⇒ kill whole pgrp, 1 ⇒ init
+}
+
+/// Write PID to the file with restricted permissions.
+#[cfg(unix)]
+fn write_daemon_pid(pid: u32) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let result = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(pid_file_path())
+        .and_then(|mut f| write!(f, "{}", pid));
+    if let Err(e) = result {
+        log::warn!("failed to write PID file: {}", e);
+    }
+}
+
+/// Remove the PID file only if it still contains `expected_pid`.
+/// Prevents a concurrent `start` from accidentally deleting a valid PID file
+/// written by another instance.
+fn remove_pid_file_for(expected_pid: u32) {
+    if read_daemon_pid() == Some(expected_pid) {
+        let _ = std::fs::remove_file(pid_file_path());
+    }
+}
+
+/// Remove the PID file unconditionally (for use after the daemon is confirmed
+/// dead, e.g. in `cmd_stop`).
+fn remove_pid_file() {
+    let _ = std::fs::remove_file(pid_file_path());
+}
+
+/// Try to acquire an exclusive advisory lock on the PID file (non-blocking).
+///
+/// Returns the `File` handle on success — the caller **must** keep it alive
+/// for the entire daemon lifetime; dropping it releases the lock.
+/// Returns `None` if the lock is already held by another process.
+#[cfg(unix)]
+fn try_acquire_daemon_lock() -> Option<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(pid_file_path())
+        .ok()?;
+    let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if ret == 0 {
+        Some(file)
+    } else {
+        None
+    }
+}
+
+/// Check whether the PID file is locked by a running daemon.
+#[cfg(unix)]
+fn is_daemon_locked() -> bool {
+    use std::os::unix::io::AsRawFd;
+
+    let file = match std::fs::File::open(pid_file_path()) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if ret == 0 {
+        // We got the lock → no daemon is holding it.  Release immediately.
+        unsafe {
+            libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+        }
+        false
+    } else {
+        true
+    }
+}
+
+/// Check whether a process with the given PID is still alive.
+#[cfg(unix)]
+fn is_process_running(pid: u32) -> bool {
+    // kill(pid, 0) checks existence without sending a signal.
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+/// Return the PID of the running daemon, or `None` if not running.
+///
+/// On Unix, uses `flock` as the authoritative check (immune to PID reuse).
+fn find_running_daemon() -> Option<u32> {
+    if is_daemon_locked() {
+        read_daemon_pid()
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+
 /// Check whether the current process is running as root / admin.
 #[cfg(unix)]
 fn is_root() -> bool {
@@ -122,6 +242,11 @@ async fn main() {
     let command = cli.command.unwrap_or_default();
 
     match command {
+        // Daemon lifecycle commands — no root required.
+        Command::Start { port, no_open } => cmd_start(port, no_open),
+        Command::Stop => cmd_stop(),
+        Command::Restart { port, no_open } => cmd_restart(port, no_open),
+
         // `serve` does NOT require root — the privileged connect-daemon
         // child process is spawned on demand via osascript / sudo.
         Command::Serve { port, no_open } => cmd_serve(port, no_open).await,
@@ -158,6 +283,184 @@ async fn main() {
 }
 
 // ---------------------------------------------------------------------------
+// `corplink start` — launch the daemon in the background and exit
+// ---------------------------------------------------------------------------
+
+fn cmd_start(port: u16, no_open: bool) {
+    // Already running?
+    if let Some(pid) = find_running_daemon() {
+        println!("daemon already running (pid {})", pid);
+        if !no_open {
+            let url = format!("http://localhost:{}", port);
+            let _ = open_browser(&url);
+        }
+        return;
+    }
+
+    // Clean up any stale PID file (lock not held ⇒ safe to remove).
+    remove_pid_file();
+
+    let exe = std::env::current_exe().unwrap_or_else(|e| {
+        eprintln!("cannot find self: {}", e);
+        exit(EPERM);
+    });
+
+    let log_path = logs_dir().join("daemon-stdout.log");
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .unwrap_or_else(|e| {
+            eprintln!("cannot open log file {}: {}", log_path.display(), e);
+            exit(EPERM);
+        });
+    let log_err = log_file
+        .try_clone()
+        .expect("failed to clone log file handle");
+
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.args(["serve", "--port", &port.to_string(), "--no-open"]);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(log_file);
+    cmd.stderr(log_err);
+
+    // Create a new session so the daemon survives terminal close.
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+
+    let child = cmd.spawn().unwrap_or_else(|e| {
+        eprintln!("failed to start daemon: {}", e);
+        exit(EPERM);
+    });
+    let pid = child.id();
+
+    // Wait for the daemon to acquire its flock (meaning the port is bound
+    // and the server is ready), or detect early exit.
+    let mut started = false;
+    for _ in 0..30 {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        if is_daemon_locked() {
+            started = true;
+            break;
+        }
+        if !is_process_running(pid) {
+            break;
+        }
+    }
+
+    if started && is_process_running(pid) {
+        println!(
+            "daemon started (pid {}), listening on http://127.0.0.1:{}",
+            pid, port
+        );
+        if !no_open {
+            let url = format!("http://localhost:{}", port);
+            let _ = open_browser(&url);
+        }
+    } else {
+        // Only remove PID file if it belongs to the child we spawned.
+        remove_pid_file_for(pid);
+        eprintln!(
+            "daemon failed to start — check logs at {}",
+            log_path.display()
+        );
+        exit(EPERM);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `corplink stop` — send SIGTERM and wait for the daemon to exit
+// ---------------------------------------------------------------------------
+
+fn cmd_stop() {
+    if !is_daemon_locked() {
+        // No daemon holds the lock — clean up any stale PID file.
+        remove_pid_file();
+        println!("daemon is not running");
+        return;
+    }
+
+    let pid = match read_daemon_pid() {
+        Some(pid) => pid,
+        None => {
+            eprintln!("daemon appears to be running (lock held) but PID is unknown");
+            exit(EPERM);
+        }
+    };
+
+    // Send SIGTERM for graceful shutdown (triggers axum graceful shutdown
+    // which in turn cleans up VPN daemon via the sentinel file).
+    #[cfg(unix)]
+    {
+        let ret = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ESRCH) {
+                println!("daemon (pid {}) already exited", pid);
+                remove_pid_file();
+                return;
+            }
+            eprintln!("failed to send SIGTERM to pid {}: {}", pid, err);
+            exit(EPERM);
+        }
+    }
+
+    // Wait up to 8 seconds for the process to exit.
+    for _ in 0..32 {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        if !is_process_running(pid) {
+            remove_pid_file();
+            println!("daemon stopped (pid {})", pid);
+            return;
+        }
+    }
+
+    // Force-kill if still alive.
+    eprintln!(
+        "daemon (pid {}) did not exit gracefully, sending SIGKILL",
+        pid
+    );
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
+
+    // Wait for SIGKILL to take effect.
+    for _ in 0..10 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if !is_process_running(pid) {
+            break;
+        }
+    }
+
+    remove_pid_file();
+    if is_process_running(pid) {
+        eprintln!("failed to kill daemon (pid {})", pid);
+        exit(EPERM);
+    }
+    println!("daemon killed (pid {})", pid);
+}
+
+// ---------------------------------------------------------------------------
+// `corplink restart` — stop then start
+// ---------------------------------------------------------------------------
+
+fn cmd_restart(port: u16, no_open: bool) {
+    if find_running_daemon().is_some() {
+        cmd_stop();
+        // Brief pause so the TCP port is released by the kernel.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    cmd_start(port, no_open);
+}
+
+// ---------------------------------------------------------------------------
 // `corplink` / `corplink serve` — daemon + web UI (no root required)
 // ---------------------------------------------------------------------------
 
@@ -166,6 +469,28 @@ async fn cmd_serve(port: u16, no_open: bool) {
     // Ensure the cookies directory exists (normal user ownership).
     let _ = cookies_dir();
     let state = web::state::new_app_state(dir);
+
+    // Bind the port first — fail early if something else is using it.
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            log::error!("failed to bind port {}: {}", port, e);
+            exit(EPERM);
+        }
+    };
+
+    // Acquire exclusive flock — prevents duplicate instances and serves as
+    // the authoritative "is daemon alive?" indicator for other commands.
+    let _lock_guard = match try_acquire_daemon_lock() {
+        Some(f) => f,
+        None => {
+            log::error!("another daemon instance is already running");
+            exit(EPERM);
+        }
+    };
+    let my_pid = std::process::id();
+    write_daemon_pid(my_pid);
 
     if !no_open {
         let url = format!("http://localhost:{}", port);
@@ -180,10 +505,14 @@ async fn cmd_serve(port: u16, no_open: bool) {
     log::info!("starting web UI on port {}", port);
 
     let state_for_shutdown = state.clone();
-    if let Err(e) = web::serve(state, port, state_for_shutdown).await {
+    if let Err(e) = web::serve(state, port, listener, state_for_shutdown).await {
         log::error!("web server error: {}", e);
+        remove_pid_file_for(my_pid);
         exit(EPERM);
     }
+
+    remove_pid_file_for(my_pid);
+    // _lock_guard is dropped here, releasing the flock
 }
 
 // ---------------------------------------------------------------------------
@@ -468,21 +797,23 @@ async fn cmd_connect(profile: &str) {
 // ---------------------------------------------------------------------------
 
 async fn cmd_status(port: u16) {
-    let url = format!("http://127.0.0.1:{}/api/status", port);
-    match reqwest::get(&url).await {
-        Ok(resp) => {
-            if let Ok(body) = resp.text().await {
-                println!("{}", body);
-            } else {
-                log::error!("failed to read status response");
-                exit(EPERM);
+    match find_running_daemon() {
+        Some(pid) => {
+            println!("daemon is running (pid {})", pid);
+            let url = format!("http://127.0.0.1:{}/api/status", port);
+            match reqwest::get(&url).await {
+                Ok(resp) => {
+                    if let Ok(body) = resp.text().await {
+                        println!("{}", body);
+                    }
+                }
+                Err(e) => {
+                    println!("cannot reach web API: {}", e);
+                }
             }
         }
-        Err(_) => {
-            println!(
-                "corplink daemon is not running (cannot reach localhost:{})",
-                port
-            );
+        None => {
+            println!("daemon is not running");
         }
     }
 }

@@ -47,18 +47,21 @@ pub fn build_router(state: AppState, port: u16) -> Router {
         .with_state(state)
 }
 
-/// Start the web server on the given port.
+/// Start the web server on a pre-bound listener.
+///
+/// The caller is responsible for binding the `TcpListener` so that PID file
+/// and flock are written only after the port is successfully acquired.
 ///
 /// On shutdown (SIGINT / SIGTERM), any running daemon child process is
 /// killed so that VPN routes and DNS are not left behind.
 pub async fn serve(
     state: AppState,
     port: u16,
+    listener: tokio::net::TcpListener,
     state_for_shutdown: AppState,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let app = build_router(state, port);
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    log::info!("web UI listening on http://{}", addr);
+    log::info!("web UI listening on http://127.0.0.1:{}", port);
 
     let shutdown = async move {
         // Wait for SIGINT (Ctrl+C) or SIGTERM.
@@ -84,7 +87,6 @@ pub async fn serve(
         kill_daemon(&state_for_shutdown).await;
     };
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
         .await?;

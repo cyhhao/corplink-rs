@@ -477,11 +477,31 @@ fn request_daemon_shutdown(tmp_dir: &Option<std::path::PathBuf>) {
     }
 }
 
+/// Askpass helper script for macOS.
+///
+/// Used with `sudo -A` to show a native password dialog via `osascript` when
+/// Touch ID (`pam_tid.so`) is not available or not configured.  This gives
+/// the best of both worlds:
+///   - Touch ID works transparently if `pam_tid.so` is configured (PAM tries
+///     it first as a `sufficient` module).
+///   - Falls back to a GUI password prompt otherwise — works in **every**
+///     terminal (Terminal.app, iTerm2, tmux, etc.).
+///   - `sudo` credential caching (default 5 min) reduces repeated prompts.
+#[cfg(target_os = "macos")]
+const ASKPASS_SCRIPT: &str = r#"#!/bin/bash
+/usr/bin/osascript -e 'display dialog "corplink-rs needs administrator privileges to manage the VPN connection." with title "Authentication Required" default answer "" with hidden answer with icon caution buttons {"Cancel", "OK"} default button "OK"' -e 'text returned of result'
+"#;
+
 /// Build the privileged command for the connect-daemon.
 ///
-/// On macOS, uses `sudo` which triggers Touch ID via `pam_tid.so`
-/// (requires `/etc/pam.d/sudo_local` with `auth sufficient pam_tid.so`).
-/// Falls back to password prompt if Touch ID is not configured.
+/// On macOS, uses `sudo -A` (askpass mode):
+///   1. PAM modules run first — if `pam_tid.so` is configured, Touch ID
+///      is tried and, when successful, no password prompt appears at all.
+///   2. If Touch ID is unavailable or not configured, `sudo` invokes the
+///      askpass helper (set via `SUDO_ASKPASS`) which shows a native macOS
+///      password dialog through `osascript`.
+///   3. Credentials are cached by `sudo` (default 5 min), so repeated
+///      connect/disconnect cycles within the window require no prompting.
 #[cfg(target_os = "macos")]
 fn build_privileged_command(
     exe: &std::path::Path,
@@ -497,8 +517,24 @@ fn build_privileged_command(
         .map(|p| p.join("logs").join("daemon-stderr.log"))
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp/corplink-daemon-stderr.log"));
 
+    // Write the askpass helper into the same temporary directory as the
+    // event pipe so it gets cleaned up automatically.
+    let askpass_path = event_pipe
+        .parent()
+        .expect("event_pipe must have a parent dir")
+        .join("askpass.sh");
+    if let Err(e) = std::fs::write(&askpass_path, ASKPASS_SCRIPT) {
+        log::warn!("failed to write askpass helper: {}", e);
+    }
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(
+            &askpass_path,
+            std::fs::Permissions::from_mode(0o700),
+        );
+    }
+
     // Use a shell wrapper so we can redirect stdout/stderr to the log file.
-    // `sudo` with `pam_tid.so` will show the Touch ID dialog.
     let inner_cmd = format!(
         "'{exe}' connect-daemon --config '{config}' --event-pipe '{pipe}' --owner-uid {uid} --owner-gid {gid} >>'{log}' 2>&1",
         exe = exe.display(),
@@ -510,7 +546,8 @@ fn build_privileged_command(
     );
 
     let mut cmd = tokio::process::Command::new("sudo");
-    cmd.args(["--stdin", "/bin/sh", "-c", &inner_cmd]);
+    cmd.args(["-A", "/bin/sh", "-c", &inner_cmd]);
+    cmd.env("SUDO_ASKPASS", &askpass_path);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
