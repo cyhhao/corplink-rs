@@ -983,8 +983,8 @@ async fn cmd_update(check_only: bool) {
         exit(EPERM);
     }
 
-    // 6. Locate the new binary (could be named `corplink-rs` or `corplink`).
-    let new_binary = ["corplink-rs", "corplink"]
+    // 6. Locate the new binary (could be named `corplink` or legacy `corplink-rs`).
+    let new_binary = ["corplink", "corplink-rs"]
         .iter()
         .map(|name| tmp_dir.join(name))
         .find(|p| p.exists());

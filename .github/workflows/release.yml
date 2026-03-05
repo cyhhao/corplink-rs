@@ -19,41 +19,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  build-archlinux:
-    name: build-archlinux
-    needs: ['create-release']
-    runs-on: ubuntu-latest
-    steps:
-      - name: checkout code
-        uses: actions/checkout@v4
-      - name: build package
-        id: build_package
-        uses: PinkD/arch-pkgbuild-builder@v2.3
-        with:
-          target: "pkgbuild"
-          pkgname: "pack"
-      - name: upload package to release
-        uses: svenstaro/upload-release-action@v2
-        with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: pack/corplink-rs-${{ github.ref_name }}*.pkg.tar.zst
-          tag: ${{ github.ref }}
-          overwrite: true
-          file_glob: true
-      - name: create tarball
-        run: |
-          cp pack/pkg/corplink-rs/usr/bin/corplink-rs .
-          cp pack/pkg/corplink-rs/etc/corplink-rs/config.json .
-          tar -czf corplink-rs-${{ github.ref_name }}-linux-$(uname -m).tar.gz corplink-rs config.json
-      - name: upload tarball to release
-        uses: svenstaro/upload-release-action@v2
-        with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: pack/corplink-rs-${{ github.ref_name }}*.tar.gz
-          tag: ${{ github.ref }}
-          overwrite: true
-          file_glob: true
-
   build-macos:
     name: build-macos
     needs: ['create-release']
@@ -72,14 +37,42 @@ jobs:
       - name: build tarball
         run: |
           cd target
-          cp release/corplink-rs .
-          cp ../config/config.json .
-          tar -czf corplink-rs-${{ github.ref_name }}-macos-$(uname -m).tar.gz corplink-rs config.json
+          cp release/corplink .
+          tar -czf corplink-${{ github.ref_name }}-macos-$(uname -m).tar.gz corplink
       - name: upload package to release
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: target/corplink-rs-*.tar.gz
+          file: target/corplink-*.tar.gz
+          tag: ${{ github.ref }}
+          overwrite: true
+          file_glob: true
+
+  build-linux:
+    name: build-linux
+    needs: ['create-release']
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout code
+        uses: actions/checkout@v4
+      - name: setup go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '>=1.22.0'
+      - name: build libwg
+        run: cd libwg && ./build.sh
+      - name: build package
+        run: cargo build --release
+      - name: build tarball
+        run: |
+          cd target
+          cp release/corplink .
+          tar -czf corplink-${{ github.ref_name }}-linux-$(uname -m).tar.gz corplink
+      - name: upload tarball to release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: target/corplink-*.tar.gz
           tag: ${{ github.ref }}
           overwrite: true
           file_glob: true
@@ -105,14 +98,13 @@ jobs:
         run: cargo build --release
       - name: build check result
         run: |
-          Move-Item -Path "target/release/corplink-rs.exe" -Destination "."
-          Move-Item -Path "config/config.json" -Destination "."
-          Compress-Archive -Path corplink-rs.exe,config.json -Destination corplink-rs-${{ github.ref_name }}-windows.zip
+          Move-Item -Path "target/release/corplink.exe" -Destination "."
+          Compress-Archive -Path corplink.exe -Destination corplink-${{ github.ref_name }}-windows.zip
       - name: upload package to release
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: corplink-rs-${{ github.ref_name }}-windows.zip
+          file: corplink-${{ github.ref_name }}-windows.zip
           tag: ${{ github.ref }}
           overwrite: true
           file_glob: true
