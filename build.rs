@@ -72,8 +72,9 @@ fn main() {
 /// This lets the binary report the release version without manually syncing
 /// Cargo.toml on every tag push.
 fn emit_build_version() {
-    // Rerun when HEAD changes (new commit, checkout, tag).
+    // Rerun when HEAD or tags change (new commit, checkout, tag).
     println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/refs/tags");
 
     let version = Command::new("git")
         .args(["describe", "--tags", "--exact-match"])
