@@ -244,6 +244,7 @@ async fn cmd_connect_daemon(config_path: &str, event_pipe_path: &str, owner_uid:
                 conf.server = Some(resp.domain);
                 let _ = conf.save().await;
                 // Fix ownership: daemon runs as root but files belong to the user.
+                #[cfg(unix)]
                 if let Some(ref cf) = conf.conf_file {
                     chown_to_user(std::path::Path::new(cf), owner_uid, owner_gid);
                 }

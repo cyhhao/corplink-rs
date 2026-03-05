@@ -25,12 +25,18 @@ jobs:
     steps:
       - name: checkout code
         uses: actions/checkout@v4
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
       - name: setup go
         uses: actions/setup-go@v5
         with:
           go-version: '>=1.22.0'
       - name: build libwg
         run: cd libwg && ./build.sh
+      - name: build frontend
+        run: cd web && npm install && npm run build
       - name: build package
         run: cargo build --release
       - name: build tarball
@@ -54,12 +60,18 @@ jobs:
     steps:
       - name: checkout code
         uses: actions/checkout@v4
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
       - name: setup go
         uses: actions/setup-go@v5
         with:
           go-version: '>=1.22.0'
       - name: build libwg
         run: cd libwg && ./build.sh
+      - name: build frontend
+        run: cd web && npm install && npm run build
       - name: build package
         run: cargo build --release
       - name: build tarball
@@ -83,12 +95,18 @@ jobs:
     steps:
       - name: checkout code
         uses: actions/checkout@v4
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
       - name: setup go
         uses: actions/setup-go@v5
         with:
           go-version: '>=1.22.0'
       - name: build libwg
         run: cd libwg && ./build.ps1
+      - name: build frontend
+        run: cd web && npm install && npm run build
       - name: rust install gnu toolchain
         run: rustup toolchain install stable-gnu
       - name: rust use gnu toolchain

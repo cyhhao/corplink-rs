@@ -443,6 +443,7 @@ struct DaemonEvent {
 }
 
 /// Create a temporary directory with a named pipe (FIFO) for daemon IPC.
+#[cfg(unix)]
 fn create_event_pipe() -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
     let tmp_dir = std::env::temp_dir().join(format!("corplink-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_dir)
@@ -516,8 +517,8 @@ fn build_privileged_command(
     cmd
 }
 
-/// Fallback for non-macOS: use sudo (prompts in terminal).
-#[cfg(not(target_os = "macos"))]
+/// Fallback for non-macOS Unix: use sudo (prompts in terminal).
+#[cfg(all(unix, not(target_os = "macos")))]
 fn build_privileged_command(
     exe: &std::path::Path,
     config_path: &str,
@@ -545,6 +546,7 @@ fn build_privileged_command(
     cmd
 }
 
+#[cfg(unix)]
 async fn do_connect(state: AppState, config_path: &str) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("cannot find self: {}", e))?;
 
@@ -679,6 +681,11 @@ async fn do_connect(state: AppState, config_path: &str) -> Result<(), String> {
     });
 
     Ok(())
+}
+
+#[cfg(not(unix))]
+async fn do_connect(_state: AppState, _config_path: &str) -> Result<(), String> {
+    Err("VPN connection is only supported on Unix (macOS/Linux)".into())
 }
 
 // ---------------------------------------------------------------------------

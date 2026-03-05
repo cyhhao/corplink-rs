@@ -96,15 +96,20 @@ fn emit_build_version() {
 }
 
 fn build_frontend() {
+    let dist_dir = PathBuf::from("web/dist");
+
     // Skip if SKIP_FRONTEND=1
     if env::var("SKIP_FRONTEND").unwrap_or_default() == "1" {
         println!("cargo:warning=Skipping frontend build (SKIP_FRONTEND=1)");
+        // Ensure web/dist/ exists so rust-embed can derive (empty = no assets).
+        let _ = std::fs::create_dir_all(&dist_dir);
         return;
     }
 
     let web_dir = PathBuf::from("web");
     if !web_dir.join("package.json").exists() {
         println!("cargo:warning=web/package.json not found, skipping frontend build");
+        let _ = std::fs::create_dir_all(&dist_dir);
         return;
     }
 
@@ -131,6 +136,7 @@ fn build_frontend() {
                     "cargo:warning=npm not found, skipping frontend build: {}",
                     e
                 );
+                let _ = std::fs::create_dir_all(&dist_dir);
                 return;
             }
         }
