@@ -71,6 +71,9 @@ pub struct ConnectionInfo {
     pub error: Option<String>,
     pub server_name: Option<String>,
     pub use_full_route: Option<bool>,
+    /// Number of orphan connect-daemon processes detected (only checked when
+    /// the UI state is Disconnected or Error).
+    pub orphan_processes: u32,
 }
 
 /// Inner mutable state behind the Arc<Mutex>.
@@ -102,6 +105,7 @@ impl AppStateInner {
             error: self.last_error.clone(),
             server_name: self.server_name.clone(),
             use_full_route: self.use_full_route,
+            orphan_processes: 0, // populated by the API handler
         }
     }
 

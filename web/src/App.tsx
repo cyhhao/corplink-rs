@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback, useRef } from 'react'
-import type { ConnectionInfo, ProfileEntry, ProfileFormData, VersionInfo, VpnServerEntry, VpnStatus } from './lib/api'
+import type { ConnectionInfo, ProfileEntry, ProfileFormData, VersionInfo, VpnServerEntry, VpnStatus, CleanupResult } from './lib/api'
 import * as api from './lib/api'
 import './index.css'
 
@@ -66,10 +66,11 @@ const btnDanger = 'px-4 py-2 rounded-lg bg-red-500/10 text-red-400 text-sm font-
 
 // ─── Connection Card ────────────────────────────────────────────────────────
 
-function ConnectionCard({ info, onDisconnect, onReconnect }: {
+function ConnectionCard({ info, onDisconnect, onReconnect, onForceCleanup }: {
   info: ConnectionInfo
   onDisconnect: () => void
   onReconnect: (opts: { vpn_server_name?: string; use_full_route?: boolean }) => void
+  onForceCleanup: () => Promise<void>
 }) {
   const elapsed = info.connected_since ? formatElapsed(new Date(info.connected_since)) : null
   const [showSettings, setShowSettings] = useState(false)
@@ -80,6 +81,51 @@ function ConnectionCard({ info, onDisconnect, onReconnect }: {
   const [showLogs, setShowLogs] = useState(false)
   const [logs, setLogs] = useState<string[]>([])
   const logsEndRef = useRef<HTMLDivElement>(null)
+  const [cleaning, setCleaning] = useState(false)
+  const [cleanupResult, setCleanupResult] = useState<CleanupResult | null>(null)
+  const [cleanupError, setCleanupError] = useState<string | null>(null)
+
+  // Grace period: only show orphan warning after status has been
+  // disconnected/error for 5+ seconds (avoids flash during reconnect).
+  const [orphanGracePassed, setOrphanGracePassed] = useState(false)
+  const graceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useEffect(() => {
+    const isIdleWithOrphans =
+      (info.status === 'disconnected' || info.status === 'error') && info.orphan_processes > 0
+
+    if (isIdleWithOrphans) {
+      // Start a 5-second timer; if still idle when it fires, show the banner.
+      if (!graceTimerRef.current) {
+        graceTimerRef.current = setTimeout(() => {
+          setOrphanGracePassed(true)
+          graceTimerRef.current = null
+        }, 5000)
+      }
+    } else {
+      // Status recovered (connecting/connected) — cancel timer, hide banner.
+      if (graceTimerRef.current) {
+        clearTimeout(graceTimerRef.current)
+        graceTimerRef.current = null
+      }
+      setOrphanGracePassed(false)
+    }
+
+    return () => {
+      if (graceTimerRef.current) {
+        clearTimeout(graceTimerRef.current)
+        graceTimerRef.current = null
+      }
+    }
+  }, [info.status, info.orphan_processes])
+
+  // Reset stale cleanup result when orphan count changes (not on status
+  // transitions — the Disconnecting→Disconnected flip during cleanup would
+  // otherwise wipe the result before the user sees it).
+  useEffect(() => {
+    setCleanupResult(null)
+    setCleanupError(null)
+  }, [info.orphan_processes])
 
   // Sync state when info changes (e.g. after reconnect completes)
   useEffect(() => {
@@ -118,6 +164,19 @@ function ConnectionCard({ info, onDisconnect, onReconnect }: {
       fetchServers()
     }
   }, [showSettings])
+
+  // Pre-fetch VPN servers once when connection is first established,
+  // so the list is ready when the user opens Settings.
+  const hasFetchedRef = useRef(false)
+  useEffect(() => {
+    if (info.status === 'connected' && !hasFetchedRef.current) {
+      hasFetchedRef.current = true
+      fetchServers()
+    }
+    if (info.status !== 'connected') {
+      hasFetchedRef.current = false
+    }
+  }, [info.status])
 
   const hasChanges = selectedServer !== (info.server_name ?? '') || fullRoute !== (info.use_full_route ?? false)
 
@@ -208,6 +267,51 @@ function ConnectionCard({ info, onDisconnect, onReconnect }: {
         <p className="text-sm text-red-400 bg-red-500/10 rounded-lg p-3 border border-red-500/20">
           {info.error}
         </p>
+      )}
+
+      {/* Orphan process warning & cleanup */}
+      {(orphanGracePassed || cleaning) && (
+        <div className="mt-3 p-4 rounded-lg border border-yellow-500/30 bg-yellow-500/10 space-y-2">
+          <p className="text-sm text-yellow-400">
+            Detected <strong>{info.orphan_processes}</strong> orphan VPN daemon process{info.orphan_processes > 1 ? 'es' : ''} running in the background.
+            This may leave VPN routes and DNS settings in an inconsistent state.
+          </p>
+          {cleanupResult && (
+            <p className="text-xs text-[var(--color-text-secondary)]">
+              Cleanup: {cleanupResult.processes_cleaned}/{cleanupResult.processes_found} killed
+              {cleanupResult.method !== 'none' && ` (via ${cleanupResult.method})`}
+            </p>
+          )}
+          {(cleanupError || cleanupResult?.error) && (
+            <p className="text-xs text-red-400">
+              {cleanupError || cleanupResult?.error}
+            </p>
+          )}
+          <button
+            onClick={async () => {
+              setCleaning(true)
+              setCleanupResult(null)
+              setCleanupError(null)
+              try {
+                const result = await api.forceCleanup()
+                setCleanupResult(result)
+              } catch (e) {
+                setCleanupError(e instanceof Error ? e.message : 'cleanup failed')
+              }
+              await onForceCleanup()
+              setCleaning(false)
+            }}
+            disabled={cleaning}
+            className={`w-full py-2 ${btnDanger} ${cleaning ? '!opacity-60' : ''}`}
+          >
+            {cleaning ? 'Cleaning up...' : 'Clean Up VPN Processes'}
+          </button>
+          {!cleaning && !cleanupResult && (
+            <p className="text-[11px] text-[var(--color-text-secondary)]">
+              Tries graceful shutdown first (preserves DNS/routes), then escalates to force kill if needed.
+            </p>
+          )}
+        </div>
       )}
 
       {/* Log panel */}
@@ -665,7 +769,7 @@ export default function App() {
       {view.type === 'main' && (
         <>
           {/* Connection status card */}
-          {info && <ConnectionCard info={info} onDisconnect={handleDisconnect} onReconnect={handleReconnect} />}
+          {info && <ConnectionCard info={info} onDisconnect={handleDisconnect} onReconnect={handleReconnect} onForceCleanup={async () => { await refresh() }} />}
 
           {/* Profiles */}
           <div className="mt-8">

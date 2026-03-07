@@ -39,6 +39,7 @@ pub fn build_router(state: AppState, port: u16) -> Router {
         .route("/api/connect", post(api::connect))
         .route("/api/disconnect", post(api::disconnect))
         .route("/api/reconnect", post(api::reconnect))
+        .route("/api/force-cleanup", post(api::force_cleanup))
         .route("/api/vpn-servers/:profile", get(api::list_vpn_servers))
         .route("/api/logs", get(api::get_logs))
         .route("/api/version", get(api::get_version))

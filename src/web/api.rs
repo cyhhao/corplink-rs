@@ -44,16 +44,21 @@ fn err_json<T: Serialize>(
     )
 }
 
-/// Validate that a profile name is safe (no path traversal).
+/// Validate that a profile name is safe (no path traversal, no shell-special chars).
 fn validate_profile_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("profile name cannot be empty".into());
     }
-    if name.contains('/') || name.contains('\\') || name.contains("..") {
-        return Err("profile name contains invalid characters".into());
-    }
     if name.starts_with('.') {
         return Err("profile name cannot start with '.'".into());
+    }
+    // Whitelist: alphanumeric, hyphen, underscore, dot.
+    // This also prevents path traversal (/, \, ..) and shell injection
+    // (', $, `, etc.) in the sudo sh -c command.
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+        return Err(
+            "profile name may only contain letters, digits, hyphens, underscores, and dots".into(),
+        );
     }
     Ok(())
 }
@@ -78,8 +83,26 @@ fn profile_entry_from_config(name: &str, conf: &Config) -> ProfileEntry {
 pub async fn get_status(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<ApiResponse<ConnectionInfo>>) {
-    let inner = state.lock().await;
-    ok_json(inner.connection_info())
+    let mut info = {
+        let inner = state.lock().await;
+        inner.connection_info()
+    };
+    // Detect orphan daemon processes when UI thinks VPN is not active.
+    // Run pgrep on a blocking thread to avoid stalling the Tokio worker.
+    if matches!(info.status, VpnStatus::Disconnected | VpnStatus::Error) {
+        info.orphan_processes = match tokio::task::spawn_blocking(|| {
+            find_connect_daemon_pids().len() as u32
+        })
+        .await
+        {
+            Ok(n) => n,
+            Err(e) => {
+                log::warn!("orphan process check failed: {}", e);
+                0
+            }
+        };
+    }
+    ok_json(info)
 }
 
 // ---------------------------------------------------------------------------
@@ -819,6 +842,360 @@ pub async fn get_logs() -> (StatusCode, Json<ApiResponse<Vec<String>>>) {
 }
 
 // ---------------------------------------------------------------------------
+// Orphan connect-daemon process detection & cleanup
+// ---------------------------------------------------------------------------
+
+/// Find PIDs of any running `connect-daemon` processes.
+///
+/// Uses `pgrep -f` with a pattern specific enough to avoid false positives.
+/// Returns a `BTreeSet` so set-intersection operations are cheap.
+#[cfg(unix)]
+fn find_connect_daemon_pids() -> std::collections::BTreeSet<u32> {
+    let output = match std::process::Command::new("pgrep")
+        .args(["-f", "corplink.*connect-daemon"])
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return Default::default(),
+    };
+    if !output.status.success() {
+        return Default::default(); // pgrep returns 1 when no matches
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse::<u32>().ok())
+        .collect()
+}
+
+#[cfg(not(unix))]
+fn find_connect_daemon_pids() -> std::collections::BTreeSet<u32> {
+    Default::default()
+}
+
+/// Return the subset of `targets` that are still alive.
+fn intersect_alive(targets: &std::collections::BTreeSet<u32>) -> std::collections::BTreeSet<u32> {
+    let current = find_connect_daemon_pids();
+    targets.intersection(&current).copied().collect()
+}
+
+/// Scan `/tmp` for any `corplink-*` directories left behind by previous serve
+/// sessions and create `shutdown` sentinel files in them.  Returns the number
+/// of sentinels created.
+#[cfg(unix)]
+fn create_orphan_sentinel_files() -> u32 {
+    let tmp = std::env::temp_dir();
+    let mut count = 0u32;
+    if let Ok(entries) = std::fs::read_dir(&tmp) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with("corplink-") {
+                let shutdown_path = entry.path().join("shutdown");
+                if !shutdown_path.exists() {
+                    if std::fs::write(&shutdown_path, b"").is_ok() {
+                        log::info!("created orphan sentinel: {}", shutdown_path.display());
+                        count += 1;
+                    }
+                }
+            }
+        }
+    }
+    count
+}
+
+#[cfg(not(unix))]
+fn create_orphan_sentinel_files() -> u32 {
+    0
+}
+
+/// Build a `sudo` command to send a signal to the given PIDs.
+///
+/// On macOS this uses `SUDO_ASKPASS` with an osascript helper so a native
+/// password dialog pops up (same mechanism used for launching the daemon).
+///
+/// The askpass script is written to a unique temporary file which the caller
+/// should remove after the command completes.
+#[cfg(target_os = "macos")]
+fn build_sudo_kill_command(
+    pids: &std::collections::BTreeSet<u32>,
+    signal: &str,
+) -> Result<(tokio::process::Command, std::path::PathBuf), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let askpass_path = std::env::temp_dir().join(format!(
+        "corplink-askpass-{}-{}.sh",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::write(&askpass_path, ASKPASS_SCRIPT)
+        .map_err(|e| format!("failed to write askpass helper: {}", e))?;
+    std::fs::set_permissions(&askpass_path, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| format!("failed to chmod askpass helper: {}", e))?;
+
+    let pid_args: Vec<String> = pids.iter().map(|p| p.to_string()).collect();
+    let mut cmd = tokio::process::Command::new("sudo");
+    cmd.env("SUDO_ASKPASS", &askpass_path);
+    cmd.arg("-A");
+    cmd.arg("kill");
+    cmd.arg(format!("-{}", signal));
+    cmd.args(&pid_args);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+    Ok((cmd, askpass_path))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn build_sudo_kill_command(
+    pids: &std::collections::BTreeSet<u32>,
+    signal: &str,
+) -> Result<(tokio::process::Command, std::path::PathBuf), String> {
+    let pid_args: Vec<String> = pids.iter().map(|p| p.to_string()).collect();
+    let mut cmd = tokio::process::Command::new("sudo");
+    cmd.arg("kill");
+    cmd.arg(format!("-{}", signal));
+    cmd.args(&pid_args);
+    cmd.stdin(std::process::Stdio::inherit());
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+    // No askpass file on Linux — return a dummy path that won't be cleaned up.
+    Ok((cmd, std::path::PathBuf::new()))
+}
+
+/// Spawn a `sudo kill` command, wait for it, log the outcome, and clean up
+/// the askpass temp file.
+#[cfg(unix)]
+async fn run_sudo_kill(
+    pids: &std::collections::BTreeSet<u32>,
+    signal: &str,
+) -> Result<(), String> {
+    let (mut cmd, askpass_path) = build_sudo_kill_command(pids, signal)?;
+    let result = match cmd.spawn() {
+        Ok(mut child) => match child.wait().await {
+            Ok(status) => {
+                if !status.success() {
+                    let code = status.code().unwrap_or(-1);
+                    log::warn!("sudo kill -{} exited with code {}", signal, code);
+                    Err(format!("sudo kill exited with code {}", code))
+                } else {
+                    Ok(())
+                }
+            }
+            Err(e) => {
+                log::warn!("failed to wait for sudo kill: {}", e);
+                Err(format!("wait failed: {}", e))
+            }
+        },
+        Err(e) => {
+            log::warn!("failed to spawn sudo kill: {}", e);
+            Err(format!("spawn failed: {}", e))
+        }
+    };
+    // Always clean up the askpass script.
+    if askpass_path.exists() {
+        let _ = std::fs::remove_file(&askpass_path);
+    }
+    result
+}
+
+/// Reset AppState to a clean disconnected state.
+async fn force_reset_state(state: &AppState) {
+    let mut inner = state.lock().await;
+    inner.status = VpnStatus::Disconnected;
+    inner.last_error = None;
+    inner.reset_connection();
+    inner.active_profile = None;
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/force-cleanup — kill orphan connect-daemon processes
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct CleanupResult {
+    /// How many connect-daemon processes were found.
+    pub processes_found: u32,
+    /// How many were successfully killed.
+    pub processes_cleaned: u32,
+    /// Escalation method used: "none", "sentinel", "sigterm", "sigkill", "partial".
+    pub method: String,
+    /// Non-empty when an escalation step fails (e.g. auth cancelled).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Three-phase cleanup:
+///   1. Sentinel files (graceful — daemon does full DNS/route cleanup)
+///   2. `sudo kill -TERM` (daemon handles SIGTERM in its select! loop)
+///   3. `sudo kill -9` (last resort, skips cleanup)
+pub async fn force_cleanup(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<ApiResponse<CleanupResult>>) {
+    // Guard: only allow cleanup when not actively connected/connecting.
+    // Set Disconnecting to prevent concurrent connect/disconnect/reconnect
+    // during the cleanup window (up to ~20s).
+    {
+        let mut inner = state.lock().await;
+        if matches!(inner.status, VpnStatus::Connected | VpnStatus::Connecting | VpnStatus::Disconnecting) {
+            return err_json(
+                StatusCode::CONFLICT,
+                format!("cannot force-cleanup in {:?} state", inner.status),
+            );
+        }
+        inner.status = VpnStatus::Disconnecting;
+    }
+
+    let targets = find_connect_daemon_pids();
+    let processes_found = targets.len() as u32;
+
+    if processes_found == 0 {
+        // No orphan processes — just clean up stale state.
+        force_reset_state(&state).await;
+        return ok_json(CleanupResult {
+            processes_found: 0,
+            processes_cleaned: 0,
+            method: "none".into(),
+            error: None,
+        });
+    }
+
+    log::info!(
+        "force-cleanup: found {} orphan connect-daemon process(es): {:?}",
+        processes_found,
+        targets
+    );
+
+    // ── Phase 1: sentinel files (no sudo required) ──────────────────────
+    // If we still have a daemon_tmp_dir in our state, use it.
+    {
+        let inner = state.lock().await;
+        request_daemon_shutdown(&inner.daemon_tmp_dir);
+    }
+    // Also scan /tmp for orphan dirs from previous serve sessions.
+    let sentinels = create_orphan_sentinel_files();
+    log::info!("force-cleanup: created {} sentinel file(s)", sentinels);
+
+    // Wait up to 10 seconds for daemon(s) to exit gracefully.
+    let mut remaining = targets.clone();
+    for _ in 0..20 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        remaining = intersect_alive(&targets);
+        if remaining.is_empty() {
+            break;
+        }
+    }
+
+    if remaining.is_empty() {
+        log::info!("force-cleanup: all processes exited via sentinel (graceful)");
+        force_reset_state(&state).await;
+        return ok_json(CleanupResult {
+            processes_found,
+            processes_cleaned: processes_found,
+            method: "sentinel".into(),
+            error: None,
+        });
+    }
+
+    // ── Phase 2: sudo kill -TERM (needs auth, but daemon still does cleanup) ─
+    log::info!(
+        "force-cleanup: {} process(es) remain after sentinel, escalating to SIGTERM: {:?}",
+        remaining.len(),
+        remaining
+    );
+
+    let mut last_error: Option<String> = None;
+
+    #[cfg(unix)]
+    {
+        match run_sudo_kill(&remaining, "TERM").await {
+            Ok(()) => {
+                // Wait up to 5 seconds for graceful exit.
+                for _ in 0..10 {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    remaining = intersect_alive(&targets);
+                    if remaining.is_empty() {
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                last_error = Some(e);
+                // Re-check: processes may have exited on their own during the
+                // sudo attempt (e.g. ESRCH because they already died).
+                remaining = intersect_alive(&targets);
+            }
+        }
+    }
+
+    if remaining.is_empty() {
+        log::info!("force-cleanup: all processes exited via SIGTERM");
+        force_reset_state(&state).await;
+        return ok_json(CleanupResult {
+            processes_found,
+            processes_cleaned: processes_found,
+            method: "sigterm".into(),
+            error: None,
+        });
+    }
+
+    // If SIGTERM failed (e.g. auth denied) and processes still remain,
+    // don't escalate to SIGKILL — the same auth prompt would fail again.
+    if last_error.is_some() {
+        force_reset_state(&state).await;
+        return ok_json(CleanupResult {
+            processes_found,
+            processes_cleaned: processes_found.saturating_sub(remaining.len() as u32),
+            method: "partial".into(),
+            error: last_error,
+        });
+    }
+
+    // ── Phase 3: sudo kill -9 (last resort — no cleanup) ────────────────
+    log::warn!(
+        "force-cleanup: {} process(es) remain after SIGTERM, escalating to SIGKILL: {:?}",
+        remaining.len(),
+        remaining
+    );
+
+    #[cfg(unix)]
+    {
+        if let Err(e) = run_sudo_kill(&remaining, "9").await {
+            last_error = Some(e);
+        }
+        // Brief wait for kernel to reclaim resources.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+
+    let final_remaining = intersect_alive(&targets);
+    let processes_cleaned = processes_found.saturating_sub(final_remaining.len() as u32);
+
+    if final_remaining.is_empty() {
+        log::info!("force-cleanup: all processes killed via SIGKILL");
+    } else {
+        log::warn!(
+            "force-cleanup: {} process(es) could not be killed: {:?}",
+            final_remaining.len(),
+            final_remaining
+        );
+    }
+
+    force_reset_state(&state).await;
+    ok_json(CleanupResult {
+        processes_found,
+        processes_cleaned,
+        method: if final_remaining.is_empty() {
+            "sigkill".into()
+        } else {
+            "partial".into()
+        },
+        error: last_error,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // POST /api/reconnect — kill daemon, update config, reconnect
 // ---------------------------------------------------------------------------
 
@@ -832,7 +1209,7 @@ pub async fn reconnect(
     State(state): State<AppState>,
     Json(req): Json<ReconnectRequest>,
 ) -> (StatusCode, Json<ApiResponse<ConnectionInfo>>) {
-    let (_active_profile, profile_path) = {
+    let (active_profile, profile_path) = {
         let inner = state.lock().await;
         match inner.status {
             VpnStatus::Connected => {}
@@ -899,6 +1276,10 @@ pub async fn reconnect(
     {
         let mut inner = state.lock().await;
         inner.reset_connection();
+        // Restore fields that the old FIFO reader cleared when it processed the
+        // "disconnected" event from the previous daemon.
+        inner.status = VpnStatus::Connecting;
+        inner.active_profile = Some(active_profile.clone());
     }
 
     // Reconnect in background.

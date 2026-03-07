@@ -11,6 +11,7 @@ export interface ConnectionInfo {
   error: string | null
   server_name: string | null
   use_full_route: boolean | null
+  orphan_processes: number
 }
 
 export interface ProfileEntry {
@@ -156,4 +157,15 @@ export async function reconnect(opts: { vpn_server_name?: string; use_full_route
 
 export async function getLogs(): Promise<string[]> {
   return api('/api/logs')
+}
+
+export interface CleanupResult {
+  processes_found: number
+  processes_cleaned: number
+  method: 'none' | 'sentinel' | 'sigterm' | 'sigkill' | 'partial'
+  error?: string
+}
+
+export async function forceCleanup(): Promise<CleanupResult> {
+  return api('/api/force-cleanup', { method: 'POST' })
 }
