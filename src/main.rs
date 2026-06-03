@@ -140,6 +140,13 @@ fn write_daemon_pid(pid: u32) {
     }
 }
 
+#[cfg(not(unix))]
+fn write_daemon_pid(pid: u32) {
+    if let Err(e) = std::fs::write(pid_file_path(), pid.to_string()) {
+        log::warn!("failed to write PID file: {}", e);
+    }
+}
+
 /// Remove the PID file only if it still contains `expected_pid`.
 /// Prevents a concurrent `start` from accidentally deleting a valid PID file
 /// written by another instance.
@@ -180,6 +187,19 @@ fn try_acquire_daemon_lock() -> Option<std::fs::File> {
     }
 }
 
+#[cfg(not(unix))]
+fn try_acquire_daemon_lock() -> Option<std::fs::File> {
+    if is_daemon_locked() {
+        return None;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(pid_file_path())
+        .ok()
+}
+
 /// Check whether the PID file is locked by a running daemon.
 #[cfg(unix)]
 fn is_daemon_locked() -> bool {
@@ -201,11 +221,36 @@ fn is_daemon_locked() -> bool {
     }
 }
 
+#[cfg(not(unix))]
+fn is_daemon_locked() -> bool {
+    read_daemon_pid().is_some_and(is_process_running)
+}
+
 /// Check whether a process with the given PID is still alive.
 #[cfg(unix)]
 fn is_process_running(pid: u32) -> bool {
     // kill(pid, 0) checks existence without sending a signal.
     unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+#[cfg(windows)]
+fn is_process_running(pid: u32) -> bool {
+    let filter = format!("PID eq {}", pid);
+    std::process::Command::new("tasklist")
+        .args(["/FI", &filter, "/FO", "CSV", "/NH"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            stdout.contains(&format!("\"{}\"", pid))
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn is_process_running(_pid: u32) -> bool {
+    false
 }
 
 /// Return the PID of the running daemon, or `None` if not running.
@@ -410,6 +455,23 @@ fn cmd_stop() {
             exit(EPERM);
         }
     }
+    #[cfg(windows)]
+    {
+        match std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string()])
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            Ok(_) => {
+                eprintln!("failed to stop daemon pid {}", pid);
+                exit(EPERM);
+            }
+            Err(e) => {
+                eprintln!("failed to run taskkill for pid {}: {}", pid, e);
+                exit(EPERM);
+            }
+        }
+    }
 
     // Wait up to 8 seconds for the process to exit.
     for _ in 0..32 {
@@ -429,6 +491,12 @@ fn cmd_stop() {
     #[cfg(unix)]
     unsafe {
         libc::kill(pid as i32, libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .status();
     }
 
     // Wait for SIGKILL to take effect.
@@ -525,8 +593,10 @@ async fn cmd_serve(port: u16, no_open: bool) {
 async fn cmd_connect_daemon(
     config_path: &str,
     event_pipe_path: &str,
-    owner_uid: u32,
-    owner_gid: u32,
+    #[cfg(unix)] owner_uid: u32,
+    #[cfg(not(unix))] _owner_uid: u32,
+    #[cfg(unix)] owner_gid: u32,
+    #[cfg(not(unix))] _owner_gid: u32,
 ) {
     use std::io::Write;
 
@@ -1099,8 +1169,9 @@ async fn run_legacy_flow(conf_file: &str) {
     });
 
     #[cfg(target_os = "macos")]
-    let use_vpn_dns = conf.use_vpn_dns.unwrap_or(false);
     let use_full_route = conf.use_full_route.unwrap_or(false);
+    #[cfg(target_os = "macos")]
+    let use_vpn_dns = conf.use_vpn_dns.unwrap_or(false);
 
     match conf.server {
         Some(_) => {}
