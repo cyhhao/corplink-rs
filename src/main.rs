@@ -522,7 +522,12 @@ async fn cmd_serve(port: u16, no_open: bool) {
 // Communicates with the parent through a named pipe (JSON events).
 // ---------------------------------------------------------------------------
 
-async fn cmd_connect_daemon(config_path: &str, event_pipe_path: &str, owner_uid: u32, owner_gid: u32) {
+async fn cmd_connect_daemon(
+    config_path: &str,
+    event_pipe_path: &str,
+    owner_uid: u32,
+    owner_gid: u32,
+) {
     use std::io::Write;
 
     // Open the event pipe for writing.  The parent is already blocking on
@@ -579,7 +584,9 @@ async fn cmd_connect_daemon(config_path: &str, event_pipe_path: &str, owner_uid:
                 }
             }
             Err(e) => {
-                emit!(serde_json::json!({"event": "error", "message": format!("failed to resolve server: {}", e)}));
+                emit!(
+                    serde_json::json!({"event": "error", "message": format!("failed to resolve server: {}", e)})
+                );
                 exit(EPERM);
             }
         }
@@ -608,7 +615,9 @@ async fn cmd_connect_daemon(config_path: &str, event_pipe_path: &str, owner_uid:
         if c.need_login() {
             log::info!("logging in...");
             if let Err(e) = c.login().await {
-                emit!(serde_json::json!({"event": "error", "message": format!("login failed: {}", e)}));
+                emit!(
+                    serde_json::json!({"event": "error", "message": format!("login failed: {}", e)})
+                );
                 exit(EPERM);
             }
         }
@@ -620,7 +629,9 @@ async fn cmd_connect_daemon(config_path: &str, event_pipe_path: &str, owner_uid:
                     logout_retry = false;
                     continue;
                 }
-                emit!(serde_json::json!({"event": "error", "message": format!("connect failed: {}", e)}));
+                emit!(
+                    serde_json::json!({"event": "error", "message": format!("connect failed: {}", e)})
+                );
                 exit(EPERM);
             }
         }
@@ -638,6 +649,12 @@ async fn cmd_connect_daemon(config_path: &str, event_pipe_path: &str, owner_uid:
     }
 
     // Routes
+    let control_plane_host = c.control_plane_ip();
+    if let Some(ref host) = control_plane_host {
+        if let Err(e) = ensure_host_route_via_default(host).await {
+            log::warn!("failed to ensure control plane route: {}", e);
+        }
+    }
     if let Some(peer_ip) = extract_peer_host(&wg_conf.peer_address) {
         if let Err(e) = c.ensure_peer_route(&peer_ip).await {
             log::warn!("failed to ensure peer route: {}", e);
@@ -645,9 +662,15 @@ async fn cmd_connect_daemon(config_path: &str, event_pipe_path: &str, owner_uid:
     }
 
     // WireGuard
-    log::info!("starting wg-corplink (tun={}, protocol={})", tun_name, wg_conf.protocol);
+    log::info!(
+        "starting wg-corplink (tun={}, protocol={})",
+        tun_name,
+        wg_conf.protocol
+    );
     if !wg::start_wg_go(tun_name, wg_conf.protocol, with_wg_log) {
-        emit!(serde_json::json!({"event": "error", "message": format!("failed to start wg — check ~/.config/corplink/logs/daemon-stderr.log for details")}));
+        emit!(
+            serde_json::json!({"event": "error", "message": format!("failed to start wg — check ~/.config/corplink/logs/daemon-stderr.log for details")})
+        );
         exit(EPERM);
     }
 
@@ -659,13 +682,27 @@ async fn cmd_connect_daemon(config_path: &str, event_pipe_path: &str, owner_uid:
         emit!(serde_json::json!({"event": "error", "message": format!("wg config failed: {}", e)}));
         exit(EPERM);
     }
+    #[cfg(target_os = "macos")]
+    if use_full_route {
+        if let Err(e) = ensure_full_route_via_vpn(&wg_conf.address).await {
+            wg::stop_wg_go();
+            emit!(
+                serde_json::json!({"event": "error", "message": format!("failed to set full route: {}", e)})
+            );
+            exit(EPERM);
+        }
+    }
 
     // DNS
     #[cfg(target_os = "macos")]
     let mut dns_manager = DNSManager::new();
     #[cfg(target_os = "macos")]
     if use_vpn_dns {
-        let dns_domains: Vec<&str> = wg_conf.dns_domain_split.iter().map(|s| s.as_str()).collect();
+        let dns_domains: Vec<&str> = wg_conf
+            .dns_domain_split
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
         if let Err(e) = dns_manager.set_dns(vec![&wg_conf.dns], dns_domains) {
             log::warn!("failed to set dns: {}", e);
         }
@@ -740,6 +777,10 @@ async fn cmd_connect_daemon(config_path: &str, event_pipe_path: &str, owner_uid:
     log::info!("disconnecting vpn (reason: {})...", disconnect_reason);
 
     // 1. Stop WireGuard — destroys TUN interface and removes all VPN routes.
+    #[cfg(target_os = "macos")]
+    if use_full_route {
+        delete_full_route();
+    }
     wg::stop_wg_go();
     log::info!("wireguard stopped, TUN interface destroyed");
 
@@ -754,22 +795,33 @@ async fn cmd_connect_daemon(config_path: &str, event_pipe_path: &str, owner_uid:
     // 3. Remove the peer host route added by ensure_peer_route().
     #[cfg(target_os = "macos")]
     if let Some(peer_ip) = extract_peer_host(&wg_conf.peer_address) {
-        let _ = std::process::Command::new("route")
-            .args(["-n", "delete", "-host", &peer_ip])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        delete_host_route(&peer_ip);
         log::debug!("removed peer host route for {}", peer_ip);
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(ref host) = control_plane_host {
+        log::debug!(
+            "keeping control plane host route for disconnect report: {}",
+            host
+        );
     }
 
     // 4. Notify server (best effort, with timeout — network is normal now).
     match tokio::time::timeout(
         std::time::Duration::from_secs(3),
         c.disconnect_vpn(&wg_conf),
-    ).await {
+    )
+    .await
+    {
         Ok(Ok(())) => log::info!("server notified of disconnect"),
         Ok(Err(e)) => log::warn!("disconnect_vpn API failed: {}", e),
         Err(_) => log::warn!("disconnect_vpn API timed out after 3s"),
+    }
+
+    #[cfg(target_os = "macos")]
+    if let Some(ref host) = control_plane_host {
+        delete_host_route(host);
+        log::debug!("removed control plane host route for {}", host);
     }
 
     emit!(serde_json::json!({"event": "disconnected", "reason": disconnect_reason}));
@@ -906,6 +958,129 @@ fn extract_peer_host(peer_address: &str) -> Option<String> {
     }
 }
 
+#[cfg(target_os = "macos")]
+async fn ensure_host_route_via_default(host: &str) -> Result<(), String> {
+    if host.parse::<std::net::IpAddr>().is_err() {
+        return Ok(());
+    }
+
+    let _ = tokio::process::Command::new("route")
+        .args(["-n", "delete", "-host", host])
+        .output()
+        .await;
+
+    let output = tokio::process::Command::new("route")
+        .args(["-n", "get", "default"])
+        .output()
+        .await
+        .map_err(|e| format!("failed to get default route: {}", e))?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to get default route: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let gateway = stdout
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix("gateway:"))
+        .map(str::trim)
+        .filter(|gateway| !gateway.is_empty())
+        .ok_or_else(|| "failed to parse gateway from default route".to_string())?;
+
+    let output = tokio::process::Command::new("route")
+        .args(["-n", "add", "-host", host, gateway])
+        .output()
+        .await
+        .map_err(|e| format!("failed to add host route for {}: {}", host, e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.contains("File exists") {
+            return Err(format!(
+                "failed to add host route for {}: {}",
+                host,
+                stderr.trim()
+            ));
+        }
+    }
+
+    log::debug!("ensured host route to {} via {}", host, gateway);
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn delete_host_route(host: &str) {
+    let _ = std::process::Command::new("route")
+        .args(["-n", "delete", "-host", host])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+#[cfg(target_os = "macos")]
+fn vpn_gateway(address: &str) -> Result<&str, String> {
+    address
+        .split_once('/')
+        .map(|(ip, _)| ip)
+        .unwrap_or(address)
+        .parse::<std::net::Ipv4Addr>()
+        .map_err(|e| format!("invalid vpn ipv4 address {}: {}", address, e))?;
+    Ok(address.split_once('/').map(|(ip, _)| ip).unwrap_or(address))
+}
+
+#[cfg(target_os = "macos")]
+async fn ensure_full_route_via_vpn(address: &str) -> Result<(), String> {
+    let gateway = vpn_gateway(address)?;
+    for route in ["0.0.0.0/1", "128.0.0.0/1"] {
+        let _ = tokio::process::Command::new("route")
+            .args(["-n", "delete", "-inet", "-net", route])
+            .output()
+            .await;
+
+        let output = tokio::process::Command::new("route")
+            .args(["-n", "add", "-inet", "-net", route, gateway])
+            .output()
+            .await
+            .map_err(|e| format!("failed to add full route {}: {}", route, e))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.contains("File exists") {
+                return Err(format!(
+                    "failed to add full route {} via {}: {}",
+                    route,
+                    gateway,
+                    stderr.trim()
+                ));
+            }
+        }
+    }
+    log::info!("ensured macOS full routes via {}", gateway);
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn delete_full_route() {
+    for route in ["0.0.0.0/1", "128.0.0.0/1"] {
+        let _ = std::process::Command::new("route")
+            .args(["-n", "delete", "-inet", "-net", route])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn ensure_host_route_via_default(_host: &str) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn delete_host_route(_host: &str) {}
+
+#[cfg(not(target_os = "macos"))]
+fn delete_full_route() {}
+
 // ---------------------------------------------------------------------------
 // Legacy flow — used by `connect` and `legacy` commands (runs in-process)
 // ---------------------------------------------------------------------------
@@ -925,6 +1100,7 @@ async fn run_legacy_flow(conf_file: &str) {
 
     #[cfg(target_os = "macos")]
     let use_vpn_dns = conf.use_vpn_dns.unwrap_or(false);
+    let use_full_route = conf.use_full_route.unwrap_or(false);
 
     match conf.server {
         Some(_) => {}
@@ -998,6 +1174,13 @@ async fn run_legacy_flow(conf_file: &str) {
         }
     }
 
+    let control_plane_host = c.control_plane_ip();
+    if let Some(ref host) = control_plane_host {
+        if let Err(err) = ensure_host_route_via_default(host).await {
+            log::warn!("failed to ensure control plane route {}: {}", host, err);
+        }
+    }
+
     log::info!("start wg-corplink for {}", &name);
     let protocol = wg_conf.protocol;
     if !wg::start_wg_go(&name, protocol, with_wg_log) {
@@ -1008,11 +1191,15 @@ async fn run_legacy_flow(conf_file: &str) {
     match uapi.config_wg(&wg_conf).await {
         Ok(_) => {}
         Err(err) => {
-            log::error!(
-                "failed to config interface with uapi for {}: {}",
-                name,
-                err
-            );
+            log::error!("failed to config interface with uapi for {}: {}", name, err);
+            exit(EPERM);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if use_full_route {
+        if let Err(err) = ensure_full_route_via_vpn(&wg_conf.address).await {
+            log::error!("failed to set full route: {}", err);
+            wg::stop_wg_go();
             exit(EPERM);
         }
     }
@@ -1022,7 +1209,11 @@ async fn run_legacy_flow(conf_file: &str) {
 
     #[cfg(target_os = "macos")]
     if use_vpn_dns {
-        let dns_domains: Vec<&str> = wg_conf.dns_domain_split.iter().map(|s| s.as_str()).collect();
+        let dns_domains: Vec<&str> = wg_conf
+            .dns_domain_split
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
         match dns_manager.set_dns(vec![&wg_conf.dns], dns_domains) {
             Ok(_) => {}
             Err(err) => {
@@ -1059,6 +1250,10 @@ async fn run_legacy_flow(conf_file: &str) {
     log::info!("disconnecting vpn...");
 
     // 1. Stop WireGuard — destroys TUN, removes VPN routes.
+    #[cfg(target_os = "macos")]
+    if use_full_route {
+        delete_full_route();
+    }
     wg::stop_wg_go();
 
     // 2. Restore DNS.
@@ -1075,21 +1270,31 @@ async fn run_legacy_flow(conf_file: &str) {
     // 3. Remove peer host route.
     #[cfg(target_os = "macos")]
     if let Some(peer_ip) = extract_peer_host(&wg_conf.peer_address) {
-        let _ = std::process::Command::new("route")
-            .args(["-n", "delete", "-host", &peer_ip])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        delete_host_route(&peer_ip);
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(ref host) = control_plane_host {
+        log::debug!(
+            "keeping control plane host route for disconnect report: {}",
+            host
+        );
     }
 
     // 4. Notify server (best effort).
     match tokio::time::timeout(
         std::time::Duration::from_secs(3),
         c.disconnect_vpn(&wg_conf),
-    ).await {
+    )
+    .await
+    {
         Ok(Ok(())) => {}
         Ok(Err(e)) => log::warn!("failed to disconnect vpn: {}", e),
         Err(_) => log::warn!("disconnect_vpn timed out"),
+    }
+
+    #[cfg(target_os = "macos")]
+    if let Some(ref host) = control_plane_host {
+        delete_host_route(host);
     }
 
     log::info!("reach exit");
@@ -1190,10 +1395,7 @@ async fn cmd_update(check_only: bool) {
         }
     };
 
-    let tag = release["tag_name"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
+    let tag = release["tag_name"].as_str().unwrap_or_default().to_string();
     let latest = normalize_version(&tag);
     let current = normalize_version(current_version);
 
@@ -1239,10 +1441,7 @@ async fn cmd_update(check_only: bool) {
     let asset = match asset {
         Some(a) => a,
         None => {
-            eprintln!(
-                "no asset found for {}-{} in release {}",
-                os, arch, tag
-            );
+            eprintln!("no asset found for {}-{} in release {}", os, arch, tag);
             eprintln!("available assets:");
             for a in assets {
                 if let Some(name) = a["name"].as_str() {
@@ -1354,7 +1553,11 @@ async fn cmd_update(check_only: bool) {
         if let Err(e) = std::fs::copy(&new_binary, &current_exe) {
             eprintln!("failed to install new binary: {}", e);
             eprintln!("you may need to run with sudo or copy manually:");
-            eprintln!("  sudo cp {} {}", new_binary.display(), current_exe.display());
+            eprintln!(
+                "  sudo cp {} {}",
+                new_binary.display(),
+                current_exe.display()
+            );
             let _ = std::fs::remove_dir_all(&tmp_dir);
             exit(EPERM);
         }

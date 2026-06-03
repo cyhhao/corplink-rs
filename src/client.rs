@@ -1,6 +1,7 @@
 use chrono::Utc;
 use std::collections::HashMap;
 use std::fmt;
+use std::net::IpAddr;
 use std::path;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -39,6 +40,26 @@ fn vpn_display_name(info: &RespVpnInfo) -> &str {
         info.en_name.as_str()
     } else {
         info.ip.as_str()
+    }
+}
+
+fn route_contains(routes: &[String], target: &str) -> bool {
+    routes.iter().any(|route| route == target)
+}
+
+fn ensure_ipv4_full_route(routes: &mut Vec<String>) {
+    let mut added = Vec::new();
+    for route in ["0.0.0.0/1", "128.0.0.0/1"] {
+        if !route_contains(routes, route) {
+            routes.push(route.to_string());
+            added.push(route);
+        }
+    }
+    if !added.is_empty() {
+        log::info!(
+            "vpn full route missing split default ipv4 routes, adding {:?}",
+            added
+        );
     }
 }
 
@@ -117,9 +138,7 @@ impl Client {
     fn with_headless(conf: Config, headless: bool) -> Result<Client, Error> {
         let f = conf.conf_file.clone().unwrap();
         let conf_path = path::Path::new(&f);
-        let parent = conf_path
-            .parent()
-            .unwrap_or(path::Path::new("."));
+        let parent = conf_path.parent().unwrap_or(path::Path::new("."));
 
         // Determine cookie directory: sibling "cookies/" for serve mode,
         // same directory for legacy mode.
@@ -224,9 +243,7 @@ impl Client {
     pub fn cookie_file_path(&self) -> std::path::PathBuf {
         let conf_file = self.conf.conf_file.clone().unwrap();
         let conf_path = path::Path::new(&conf_file);
-        let parent = conf_path
-            .parent()
-            .unwrap_or(path::Path::new("."));
+        let parent = conf_path.parent().unwrap_or(path::Path::new("."));
 
         let cookie_dir = if parent.file_name().map_or(false, |n| n == "profiles") {
             // serve / connect-daemon mode: ~/.config/corplink/cookies/
@@ -241,6 +258,17 @@ impl Client {
 
         let iface = self.conf.interface_name.clone().unwrap();
         cookie_dir.join(format!("{}_{}", iface, COOKIE_FILE_SUFFIX))
+    }
+
+    pub fn control_plane_host(&self) -> Option<String> {
+        let server = self.conf.server.as_ref()?;
+        let parsed = Url::parse(server).ok()?;
+        parsed.host_str().map(|host| host.to_string())
+    }
+
+    pub fn control_plane_ip(&self) -> Option<String> {
+        let host = self.control_plane_host()?;
+        host.parse::<IpAddr>().ok().map(|ip| ip.to_string())
     }
 
     fn csrf_token_for_url(&self, url: &str) -> Option<String> {
@@ -607,11 +635,7 @@ impl Client {
     /// Handle MFA based on server-provided auth_list.
     /// Prefers OTP if user has TOTP secret configured, otherwise uses email.
     async fn handle_mfa(&mut self, auth_list: &[String]) -> Result<(), Error> {
-        let has_totp_secret = self
-            .conf
-            .code
-            .as_ref()
-            .map_or(false, |c| !c.is_empty());
+        let has_totp_secret = self.conf.code.as_ref().map_or(false, |c| !c.is_empty());
 
         // Prefer OTP if user has TOTP secret and server supports it
         if has_totp_secret && auth_list.contains(&"otp".to_string()) {
@@ -643,10 +667,7 @@ impl Client {
         let mut m = Map::new();
         m.insert("account".to_string(), json!(&self.conf.username));
         m.insert("mfa_type".to_string(), json!(mfa_type));
-        m.insert(
-            "login_scene".to_string(),
-            json!(PLATFORM_CORPLINK),
-        );
+        m.insert("login_scene".to_string(), json!(PLATFORM_CORPLINK));
 
         let resp = self
             .request::<Value>(ApiName::LoginMfaSend, Some(m))
@@ -706,7 +727,10 @@ impl Client {
 
                 if let Some(next) = &login_resp.next {
                     if next.action == "2FA" {
-                        log::info!("server requires 2FA for ldap, auth_list: {:?}", next.auth_list);
+                        log::info!(
+                            "server requires 2FA for ldap, auth_list: {:?}",
+                            next.auth_list
+                        );
                         self.handle_mfa(&next.auth_list).await?;
                     }
                 }
@@ -824,7 +848,9 @@ impl Client {
             log::warn!("failed to get otp code");
             return Ok(());
         }
-        Err(Error::Error("no available login method, please provide a valid platform".to_string()))
+        Err(Error::Error(
+            "no available login method, please provide a valid platform".to_string(),
+        ))
     }
 
     async fn get_login_method(&mut self) -> Result<RespLoginMethod, Error> {
@@ -1119,6 +1145,7 @@ impl Client {
             if has_ipv6 {
                 routes.extend(wg_info.setting.v6_route_full);
             }
+            ensure_ipv4_full_route(&mut routes);
             routes
         } else {
             log::info!("using split route mode");
@@ -1131,10 +1158,7 @@ impl Client {
         // Auto add private network routes if enabled (default: true in split route mode)
         let include_private = self.conf.include_private_routes.unwrap_or(!use_full_route);
         if include_private && !use_full_route {
-            let private_routes = vec![
-                "10.0.0.0/8".to_string(),
-                "172.16.0.0/12".to_string(),
-            ];
+            let private_routes = vec!["10.0.0.0/8".to_string(), "172.16.0.0/12".to_string()];
             log::info!("adding private network routes: {:?}", private_routes);
             route.extend(private_routes);
         }
@@ -1143,6 +1167,17 @@ impl Client {
         if let Some(extra) = &self.conf.extra_routes {
             log::info!("adding extra routes: {:?}", extra);
             route.extend(extra.clone());
+        }
+
+        if let Some(control_ip) = self.control_plane_ip() {
+            let before = route.len();
+            route.retain(|r| {
+                let route_ip = r.split_once('/').map_or(r.as_str(), |(ip, _)| ip);
+                route_ip != control_ip
+            });
+            if route.len() != before {
+                log::info!("removed control plane host {} from vpn routes", control_ip);
+            }
         }
 
         // Get DNS domain split config
