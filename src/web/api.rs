@@ -4,6 +4,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
+use crate::resp::VpnProtocol;
 use crate::web::state::{AppState, ConnectionInfo, ProfileEntry, ProfileFormData, VpnStatus};
 
 // ---------------------------------------------------------------------------
@@ -1363,16 +1364,18 @@ async fn do_list_vpn_servers(
 
     let servers = vpn_list
         .into_iter()
-        .map(|v| VpnServerEntry {
-            name: v.name,
-            en_name: v.en_name,
-            ip: v.ip,
-            vpn_port: v.vpn_port,
-            protocol: match v.protocol_mode {
-                1 => "tcp".to_string(),
-                2 => "udp".to_string(),
-                _ => "unknown".to_string(),
-            },
+        .map(|v| {
+            let protocol = VpnProtocol::from_api_mode(v.protocol_mode)
+                .map(VpnProtocol::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            VpnServerEntry {
+                name: v.name,
+                en_name: v.en_name,
+                ip: v.ip,
+                vpn_port: v.vpn_port,
+                protocol,
+            }
         })
         .collect();
 
