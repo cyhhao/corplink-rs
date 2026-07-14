@@ -1055,22 +1055,15 @@ impl Client {
         );
         let protocol_filtered: Vec<RespVpnInfo> = vpn_info
             .into_iter()
-            .filter(|vpn| {
-                let mode = match vpn.protocol_mode {
-                    1 => "tcp",
-                    2 => "udp",
-                    _ => "unknown protocol",
-                };
-                match mode {
-                    "udp" | "tcp" => true,
-                    _ => {
-                        log::info!(
-                            "server name {} is not support {} wg for now",
-                            vpn_display_name(vpn),
-                            mode
-                        );
-                        false
-                    }
+            .filter(|vpn| match VpnProtocol::from_api_mode(vpn.protocol_mode) {
+                Some(_) => true,
+                None => {
+                    log::info!(
+                        "server name {} uses unsupported protocol mode {}",
+                        vpn_display_name(vpn),
+                        vpn.protocol_mode
+                    );
+                    false
                 }
             })
             .collect();
@@ -1115,6 +1108,13 @@ impl Client {
         } else {
             self.prompt_vpn_choice(protocol_filtered).await?
         };
+
+        let protocol = VpnProtocol::from_api_mode(selected_vpn.protocol_mode).ok_or_else(|| {
+            Error::Error(format!(
+                "unsupported vpn protocol mode {}",
+                selected_vpn.protocol_mode
+            ))
+        })?;
 
         let vpn_addr = format!("{}:{}", selected_vpn.ip, selected_vpn.vpn_port);
         log::info!(
@@ -1195,12 +1195,7 @@ impl Client {
             route,
             dns,
             dns_domain_split,
-            protocol: match selected_vpn.protocol_mode {
-                // tcp
-                1 => 1,
-                // udp
-                _ => 0,
-            },
+            protocol: protocol.wireguard_mode(),
             server_name: vpn_display_name(&selected_vpn).to_string(),
         };
         Ok(wg_conf)

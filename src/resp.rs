@@ -74,13 +74,43 @@ pub struct RespVpnInfo {
     pub api_port: u16,
     pub vpn_port: u16,
     pub ip: String,
-    /// 1 for tcp, 2 for udp
+    /// 0 or 2 for UDP, 1 for TCP.
     pub protocol_mode: i32,
     pub name: String,
     pub en_name: String,
     pub icon: String,
     pub id: i32,
     pub timeout: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VpnProtocol {
+    Udp,
+    Tcp,
+}
+
+impl VpnProtocol {
+    pub fn from_api_mode(mode: i32) -> Option<Self> {
+        match mode {
+            0 | 2 => Some(Self::Udp),
+            1 => Some(Self::Tcp),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Udp => "udp",
+            Self::Tcp => "tcp",
+        }
+    }
+
+    pub fn wireguard_mode(self) -> i32 {
+        match self {
+            Self::Udp => 0,
+            Self::Tcp => 1,
+        }
+    }
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -103,4 +133,32 @@ pub struct RespWgInfo {
     pub public_key: String,
     pub setting: RespWgExtraInfo,
     pub mode: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VpnProtocol;
+
+    #[test]
+    fn test_vpn_protocol_accepts_current_and_legacy_udp_modes() {
+        assert_eq!(VpnProtocol::from_api_mode(0), Some(VpnProtocol::Udp));
+        assert_eq!(VpnProtocol::from_api_mode(2), Some(VpnProtocol::Udp));
+    }
+
+    #[test]
+    fn test_vpn_protocol_maps_tcp_mode() {
+        assert_eq!(VpnProtocol::from_api_mode(1), Some(VpnProtocol::Tcp));
+    }
+
+    #[test]
+    fn test_vpn_protocol_rejects_unknown_modes() {
+        assert_eq!(VpnProtocol::from_api_mode(-1), None);
+        assert_eq!(VpnProtocol::from_api_mode(3), None);
+    }
+
+    #[test]
+    fn test_vpn_protocol_maps_wireguard_modes() {
+        assert_eq!(VpnProtocol::Udp.wireguard_mode(), 0);
+        assert_eq!(VpnProtocol::Tcp.wireguard_mode(), 1);
+    }
 }
