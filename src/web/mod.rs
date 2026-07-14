@@ -53,13 +53,14 @@ pub fn build_router(state: AppState, port: u16) -> Router {
 /// The caller is responsible for binding the `TcpListener` so that PID file
 /// and flock are written only after the port is successfully acquired.
 ///
-/// On shutdown (SIGINT / SIGTERM), any running daemon child process is
-/// killed so that VPN routes and DNS are not left behind.
+/// On shutdown (SIGINT / SIGTERM / shutdown file), any running daemon child
+/// process is killed so that VPN routes and DNS are not left behind.
 pub async fn serve(
     state: AppState,
     port: u16,
     listener: tokio::net::TcpListener,
     state_for_shutdown: AppState,
+    shutdown_file: std::path::PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let app = build_router(state, port);
     log::info!("web UI listening on http://127.0.0.1:{}", port);
@@ -67,6 +68,15 @@ pub async fn serve(
     let shutdown = async move {
         // Wait for SIGINT (Ctrl+C) or SIGTERM.
         let ctrl_c = tokio::signal::ctrl_c();
+        let file_shutdown = async {
+            loop {
+                if shutdown_file.exists() {
+                    log::info!("received shutdown request, shutting down...");
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        };
         #[cfg(unix)]
         let mut sigterm = tokio::signal::unix::signal(
             tokio::signal::unix::SignalKind::terminate(),
@@ -77,12 +87,15 @@ pub async fn serve(
         tokio::select! {
             _ = ctrl_c => { log::info!("received SIGINT, shutting down..."); }
             _ = sigterm.recv() => { log::info!("received SIGTERM, shutting down..."); }
+            _ = file_shutdown => {}
         }
         #[cfg(not(unix))]
-        {
-            ctrl_c.await.ok();
-            log::info!("received SIGINT, shutting down...");
+        tokio::select! {
+            _ = ctrl_c => { log::info!("received SIGINT, shutting down..."); }
+            _ = file_shutdown => {}
         }
+
+        let _ = std::fs::remove_file(shutdown_file);
 
         // Kill the daemon child process if it is still running.
         kill_daemon(&state_for_shutdown).await;
@@ -300,5 +313,31 @@ mod tests {
             "fallback should be html or plain text, got: {}",
             ct
         );
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_file_stops_server() {
+        let state = test_state("shutdown_file");
+        let shutdown_file = state.lock().await.profiles_dir.join("daemon.shutdown");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let writer_path = shutdown_file.clone();
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            std::fs::write(writer_path, b"").unwrap();
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            serve(state.clone(), port, listener, state, shutdown_file.clone()),
+        )
+        .await
+        .expect("server did not stop after shutdown file was created");
+
+        writer.await.unwrap();
+        assert!(result.is_ok());
+        assert!(!shutdown_file.exists());
     }
 }

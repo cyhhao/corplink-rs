@@ -77,6 +77,25 @@ pub enum Command {
         check: bool,
     },
 
+    /// (Internal) Finish a Windows update after the parent process exits
+    #[command(name = "apply-update", hide = true)]
+    ApplyUpdate {
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        staged: String,
+        #[arg(long)]
+        backup: String,
+        #[arg(long)]
+        expected_version: String,
+        #[arg(long)]
+        parent_pid: u32,
+        #[arg(long)]
+        restart_port: Option<u16>,
+        #[arg(long)]
+        cleanup_dir: String,
+    },
+
     /// (Internal) Privileged VPN daemon — spawned by `serve` via sudo
     #[command(name = "connect-daemon", hide = true)]
     ConnectDaemon {
