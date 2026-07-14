@@ -79,6 +79,7 @@ TMP_DIR="$(mktemp -d)"
 TARGET_BIN="${INSTALL_DIR}/${BIN_NAME}"
 STAGED_BIN="${INSTALL_DIR}/.${BIN_NAME}.new.$$"
 BACKUP_BIN="${INSTALL_DIR}/.${BIN_NAME}.backup.$$"
+KEEP_BACKUP=0
 
 if [ -w "$INSTALL_DIR" ]; then
   USE_SUDO=0
@@ -94,10 +95,34 @@ run_privileged() {
   fi
 }
 
+DAEMON_HOME="$HOME"
+if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+  case "$OS" in
+    Darwin) DAEMON_HOME="/Users/${SUDO_USER}" ;;
+    Linux)
+      DAEMON_HOME="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)"
+      if [ -z "$DAEMON_HOME" ]; then
+        DAEMON_HOME="/home/${SUDO_USER}"
+      fi
+      ;;
+  esac
+fi
+
+run_as_daemon_user() {
+  if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+    sudo -u "$SUDO_USER" env HOME="$DAEMON_HOME" USER="$SUDO_USER" LOGNAME="$SUDO_USER" "$@"
+  else
+    "$@"
+  fi
+}
+
 cleanup() {
   rm -rf "$TMP_DIR"
-  if [ -e "$STAGED_BIN" ] || [ -L "$STAGED_BIN" ] || [ -e "$BACKUP_BIN" ] || [ -L "$BACKUP_BIN" ]; then
-    run_privileged rm -f "$STAGED_BIN" "$BACKUP_BIN" >/dev/null 2>&1 || true
+  if [ -e "$STAGED_BIN" ] || [ -L "$STAGED_BIN" ]; then
+    run_privileged rm -f "$STAGED_BIN" >/dev/null 2>&1 || true
+  fi
+  if [ "$KEEP_BACKUP" -eq 0 ] && { [ -e "$BACKUP_BIN" ] || [ -L "$BACKUP_BIN" ]; }; then
+    run_privileged rm -f "$BACKUP_BIN" >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
@@ -150,7 +175,7 @@ fi
 
 WAS_RUNNING=0
 DAEMON_PORT=4027
-RUNTIME_FILE="${HOME}/.config/corplink/daemon-runtime.json"
+RUNTIME_FILE="${DAEMON_HOME}/.config/corplink/daemon-runtime.json"
 if [ -f "$TARGET_BIN" ]; then
   if [ -f "$RUNTIME_FILE" ]; then
     SAVED_PORT="$(sed -n 's/.*"port":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$RUNTIME_FILE")"
@@ -158,7 +183,7 @@ if [ -f "$TARGET_BIN" ]; then
       DAEMON_PORT="$SAVED_PORT"
     fi
   fi
-  STATUS_OUTPUT="$("$TARGET_BIN" status --port "$DAEMON_PORT" 2>/dev/null || true)"
+  STATUS_OUTPUT="$(run_as_daemon_user "$TARGET_BIN" status --port "$DAEMON_PORT" 2>/dev/null || true)"
   case "$STATUS_OUTPUT" in
     "daemon is running"*)
     WAS_RUNNING=1
@@ -173,7 +198,7 @@ sync
 
 if [ "$WAS_RUNNING" -eq 1 ]; then
   echo "stopping running corplink daemon ..."
-  if ! "$TARGET_BIN" stop; then
+  if ! run_as_daemon_user "$TARGET_BIN" stop; then
     echo "error: failed to stop running daemon; existing installation was not changed"
     exit 1
   fi
@@ -183,7 +208,7 @@ echo "installing to ${TARGET_BIN} ..."
 if ! run_privileged mv -f "$STAGED_BIN" "$TARGET_BIN"; then
   echo "error: atomic install failed; existing binary was not changed"
   if [ "$WAS_RUNNING" -eq 1 ]; then
-    "$TARGET_BIN" start --port "$DAEMON_PORT" --no-open || true
+    run_as_daemon_user "$TARGET_BIN" start --port "$DAEMON_PORT" --no-open || true
   fi
   exit 1
 fi
@@ -192,22 +217,32 @@ INSTALLED_VERSION="$("$TARGET_BIN" --version 2>/dev/null || true)"
 if [ "${INSTALLED_VERSION##* }" != "$EXPECTED_VERSION" ]; then
   echo "error: installed binary validation failed; rolling back"
   if [ -f "$BACKUP_BIN" ]; then
-    run_privileged mv -f "$BACKUP_BIN" "$TARGET_BIN"
+    KEEP_BACKUP=1
+    if ! run_privileged mv -f "$BACKUP_BIN" "$TARGET_BIN"; then
+      echo "error: rollback failed; previous binary retained at ${BACKUP_BIN}"
+      exit 1
+    fi
+    KEEP_BACKUP=0
   fi
   if [ "$WAS_RUNNING" -eq 1 ]; then
-    "$TARGET_BIN" start --port "$DAEMON_PORT" --no-open || true
+    run_as_daemon_user "$TARGET_BIN" start --port "$DAEMON_PORT" --no-open || true
   fi
   exit 1
 fi
 
 if [ "$WAS_RUNNING" -eq 1 ]; then
   echo "restarting corplink daemon on port ${DAEMON_PORT} ..."
-  if ! "$TARGET_BIN" start --port "$DAEMON_PORT" --no-open; then
+  if ! run_as_daemon_user "$TARGET_BIN" start --port "$DAEMON_PORT" --no-open; then
     echo "error: new daemon failed to start; rolling back"
     if [ -f "$BACKUP_BIN" ]; then
-      "$TARGET_BIN" stop || true
-      run_privileged mv -f "$BACKUP_BIN" "$TARGET_BIN"
-      "$TARGET_BIN" start --port "$DAEMON_PORT" --no-open || true
+      run_as_daemon_user "$TARGET_BIN" stop || true
+      KEEP_BACKUP=1
+      if ! run_privileged mv -f "$BACKUP_BIN" "$TARGET_BIN"; then
+        echo "error: rollback failed; previous binary retained at ${BACKUP_BIN}"
+        exit 1
+      fi
+      KEEP_BACKUP=0
+      run_as_daemon_user "$TARGET_BIN" start --port "$DAEMON_PORT" --no-open || true
     fi
     exit 1
   fi

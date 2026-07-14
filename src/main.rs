@@ -125,6 +125,10 @@ fn daemon_runtime_path() -> PathBuf {
     config_dir().join("daemon-runtime.json")
 }
 
+fn daemon_shutdown_path() -> PathBuf {
+    config_dir().join("daemon.shutdown")
+}
+
 fn write_daemon_runtime(pid: u32, port: u16) {
     let info = DaemonRuntimeInfo { pid, port };
     match serde_json::to_vec(&info) {
@@ -159,11 +163,13 @@ fn remove_daemon_runtime_for(expected_pid: u32) {
 fn remove_daemon_state_for(expected_pid: u32) {
     remove_pid_file_for(expected_pid);
     remove_daemon_runtime_for(expected_pid);
+    let _ = std::fs::remove_file(daemon_shutdown_path());
 }
 
 fn remove_daemon_state() {
     remove_pid_file();
     let _ = std::fs::remove_file(daemon_runtime_path());
+    let _ = std::fs::remove_file(daemon_shutdown_path());
 }
 
 /// Read the PID recorded in the PID file, rejecting obviously invalid values.
@@ -528,17 +534,11 @@ fn stop_daemon() -> Result<StopOutcome, String> {
     }
     #[cfg(windows)]
     {
-        match std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string()])
-            .status()
-        {
-            Ok(status) if status.success() => {}
-            Ok(_) => {
-                return Err(format!("failed to stop daemon pid {}", pid));
-            }
-            Err(e) => {
-                return Err(format!("failed to run taskkill for pid {}: {}", pid, e));
-            }
+        if let Err(e) = std::fs::write(daemon_shutdown_path(), b"") {
+            return Err(format!(
+                "failed to request graceful daemon shutdown for pid {}: {}",
+                pid, e
+            ));
         }
     }
 
@@ -653,7 +653,15 @@ async fn cmd_serve(port: u16, no_open: bool) {
     log::info!("starting web UI on port {}", port);
 
     let state_for_shutdown = state.clone();
-    if let Err(e) = web::serve(state, port, listener, state_for_shutdown).await {
+    if let Err(e) = web::serve(
+        state,
+        port,
+        listener,
+        state_for_shutdown,
+        daemon_shutdown_path(),
+    )
+    .await
+    {
         log::error!("web server error: {}", e);
         remove_daemon_state_for(my_pid);
         exit(EPERM);
@@ -1508,8 +1516,44 @@ fn platform_asset_suffix() -> Option<(&'static str, &'static str)> {
 }
 
 fn restart_daemon_with_binary(binary: &std::path::Path, port: u16) -> Result<(), String> {
-    let status = std::process::Command::new(binary)
-        .args(["start", "--port", &port.to_string(), "--no-open"])
+    let mut command = std::process::Command::new(binary);
+    command.args(["start", "--port", &port.to_string(), "--no-open"]);
+
+    #[cfg(unix)]
+    if unsafe { libc::geteuid() } == 0 {
+        let sudo_uid = std::env::var("SUDO_UID")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok());
+        let sudo_gid = std::env::var("SUDO_GID")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok());
+        if let (Some(uid), Some(gid)) = (sudo_uid, sudo_gid) {
+            use std::os::unix::process::CommandExt;
+
+            if let Some(home) = real_config_dir().parent() {
+                command.env("HOME", home);
+            }
+            if let Ok(user) = std::env::var("SUDO_USER") {
+                command.env("USER", &user).env("LOGNAME", user);
+            }
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::setgroups(0, std::ptr::null()) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::setgid(gid) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::setuid(uid) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+    }
+
+    let status = command
         .status()
         .map_err(|e| format!("failed to restart daemon: {}", e))?;
     if status.success() {
@@ -1519,6 +1563,17 @@ fn restart_daemon_with_binary(binary: &std::path::Path, port: u16) -> Result<(),
             "daemon restart exited with {}",
             status.code().unwrap_or(-1)
         ))
+    }
+}
+
+fn can_restart_daemon_safely() -> bool {
+    #[cfg(windows)]
+    {
+        !is_root()
+    }
+    #[cfg(not(windows))]
+    {
+        true
     }
 }
 
@@ -1538,17 +1593,12 @@ fn stop_daemon_for_update() -> Result<(), String> {
 
 async fn running_daemon_version(http: &reqwest::Client, port: u16) -> Option<String> {
     let url = format!("http://127.0.0.1:{}/api/version", port);
-    let response = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        http.get(url).send(),
-    )
-    .await
-    .ok()?
-    .ok()?;
+    let response = tokio::time::timeout(std::time::Duration::from_secs(2), http.get(url).send())
+        .await
+        .ok()?
+        .ok()?;
     let body: serde_json::Value = response.json().await.ok()?;
-    body["data"]["version"]
-        .as_str()
-        .map(normalize_version)
+    body["data"]["version"].as_str().map(normalize_version)
 }
 
 fn rollback_update(
@@ -1641,10 +1691,19 @@ fn cmd_apply_update(
     if let Err(e) = result {
         eprintln!("update failed: {}", e);
         match rollback_update(&prepared, restart_port) {
-            Ok(_) => eprintln!("restored previous version"),
-            Err(rollback_err) => eprintln!("rollback failed: {}", rollback_err),
+            Ok(_) => {
+                eprintln!("restored previous version");
+                prepared.cleanup();
+            }
+            Err(rollback_err) => {
+                eprintln!("rollback failed: {}", rollback_err);
+                eprintln!(
+                    "previous executable backup retained at {}",
+                    prepared.backup().display()
+                );
+                prepared.cleanup_staged();
+            }
         }
-        prepared.cleanup();
         exit(EPERM);
     }
 
@@ -1740,6 +1799,13 @@ async fn cmd_update(check_only: bool) {
                             "daemon is still running version {}; restarting with {} ...",
                             daemon_version, current
                         );
+                        if !can_restart_daemon_safely() {
+                            eprintln!(
+                                "daemon was not restarted from an elevated process; run `corplink restart --port {}` as the normal user",
+                                port
+                            );
+                            return;
+                        }
                         let restart_result = stop_daemon_for_update().and_then(|_| {
                             let current_exe = std::env::current_exe().map_err(|e| {
                                 format!("cannot determine current executable path: {}", e)
@@ -1831,8 +1897,7 @@ async fn cmd_update(check_only: bool) {
         }
     };
 
-    let tmp_dir =
-        std::env::temp_dir().join(format!("corplink-update-{}", std::process::id()));
+    let tmp_dir = std::env::temp_dir().join(format!("corplink-update-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp_dir);
     std::fs::create_dir_all(&tmp_dir).expect("failed to create temp dir");
 
@@ -1903,10 +1968,11 @@ async fn cmd_update(check_only: bool) {
         }
     };
 
-    let restart_port =
+    let daemon_port =
         find_running_daemon().map(|pid| read_daemon_port(pid).unwrap_or(DEFAULT_PORT));
+    let restart_port = daemon_port.filter(|_| can_restart_daemon_safely());
 
-    if restart_port.is_some() {
+    if daemon_port.is_some() {
         println!("stopping daemon before installing update ...");
         if let Err(e) = stop_daemon_for_update() {
             eprintln!("failed to stop daemon: {}", e);
@@ -1932,6 +1998,9 @@ async fn cmd_update(check_only: bool) {
             exit(EPERM);
         }
         println!("update helper started; installation will finish after this process exits");
+        if daemon_port.is_some() && restart_port.is_none() {
+            println!("daemon will remain stopped; restart it as the normal user");
+        }
         return;
     }
 
@@ -1949,16 +2018,28 @@ async fn cmd_update(check_only: bool) {
         if let Err(e) = install_result {
             eprintln!("update failed: {}", e);
             match rollback_update(&prepared, restart_port) {
-                Ok(_) => eprintln!("restored previous version"),
-                Err(rollback_err) => eprintln!("rollback failed: {}", rollback_err),
+                Ok(_) => {
+                    eprintln!("restored previous version");
+                    prepared.cleanup();
+                }
+                Err(rollback_err) => {
+                    eprintln!("rollback failed: {}", rollback_err);
+                    eprintln!(
+                        "previous executable backup retained at {}",
+                        prepared.backup().display()
+                    );
+                    prepared.cleanup_staged();
+                }
             }
-            prepared.cleanup();
             let _ = std::fs::remove_dir_all(&tmp_dir);
             exit(EPERM);
         }
 
         prepared.cleanup();
         let _ = std::fs::remove_dir_all(&tmp_dir);
+        if daemon_port.is_some() && restart_port.is_none() {
+            println!("daemon remains stopped; restart it as the normal user");
+        }
         println!("updated to {} successfully!", latest);
     }
 }

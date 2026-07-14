@@ -68,7 +68,6 @@ impl PreparedUpdate {
         &self.staged
     }
 
-    #[cfg(windows)]
     pub fn backup(&self) -> &Path {
         &self.backup
     }
@@ -94,8 +93,12 @@ impl PreparedUpdate {
     }
 
     pub fn cleanup(&self) {
-        let _ = fs::remove_file(&self.staged);
+        self.cleanup_staged();
         let _ = fs::remove_file(&self.backup);
+    }
+
+    pub fn cleanup_staged(&self) {
+        let _ = fs::remove_file(&self.staged);
     }
 }
 
@@ -320,6 +323,30 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(fs::read(&target).unwrap(), b"old-binary");
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_cleanup_staged_preserves_rollback_backup() {
+        let dir = test_dir("preserve-backup");
+        let target = dir.join("corplink");
+        let source = dir.join("downloaded-corplink");
+        let expected_version = env!("BUILD_VERSION");
+        fs::write(
+            &source,
+            format!("#!/bin/sh\necho 'corplink {}'\n", expected_version),
+        )
+        .unwrap();
+        fs::write(&target, b"old-binary").unwrap();
+
+        let prepared = PreparedUpdate::prepare(&source, &target, expected_version).unwrap();
+        let backup = prepared.backup().to_path_buf();
+        prepared.cleanup_staged();
+
+        assert!(backup.exists());
+        assert_eq!(fs::read(backup).unwrap(), b"old-binary");
+        prepared.cleanup();
         let _ = fs::remove_dir_all(dir);
     }
 }
