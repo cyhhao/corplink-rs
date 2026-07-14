@@ -7,8 +7,8 @@ set -euo pipefail
 #
 # Installs the latest release of corplink to /usr/local/bin.
 
-REPO="cyhhao/corplink-rs"
-INSTALL_DIR="/usr/local/bin"
+REPO="${CORPLINK_REPO:-cyhhao/corplink-rs}"
+INSTALL_DIR="${CORPLINK_INSTALL_DIR:-/usr/local/bin}"
 BIN_NAME="corplink"
 
 # ── Detect platform ────────────────────────────────────────────────────────
@@ -76,7 +76,31 @@ echo "downloading $ASSET_NAME ..."
 # ── Download and extract ──────────────────────────────────────────────────
 
 TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "$TMP_DIR"' EXIT
+TARGET_BIN="${INSTALL_DIR}/${BIN_NAME}"
+STAGED_BIN="${INSTALL_DIR}/.${BIN_NAME}.new.$$"
+BACKUP_BIN="${INSTALL_DIR}/.${BIN_NAME}.backup.$$"
+
+if [ -w "$INSTALL_DIR" ]; then
+  USE_SUDO=0
+else
+  USE_SUDO=1
+fi
+
+run_privileged() {
+  if [ "$USE_SUDO" -eq 1 ]; then
+    sudo "$@"
+  else
+    "$@"
+  fi
+}
+
+cleanup() {
+  rm -rf "$TMP_DIR"
+  if [ -e "$STAGED_BIN" ] || [ -L "$STAGED_BIN" ] || [ -e "$BACKUP_BIN" ] || [ -L "$BACKUP_BIN" ]; then
+    run_privileged rm -f "$STAGED_BIN" "$BACKUP_BIN" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
 
 curl -fSL "$DOWNLOAD_URL" -o "${TMP_DIR}/${ASSET_NAME}"
 
@@ -106,17 +130,93 @@ fi
 
 chmod +x "$NEW_BIN"
 
-# ── Install ───────────────────────────────────────────────────────────────
-
-if [ -w "$INSTALL_DIR" ]; then
-  mv "$NEW_BIN" "${INSTALL_DIR}/${BIN_NAME}"
-else
-  echo "installing to ${INSTALL_DIR}/${BIN_NAME} (requires sudo) ..."
-  sudo mv "$NEW_BIN" "${INSTALL_DIR}/${BIN_NAME}"
+EXPECTED_VERSION="${TAG#v}"
+VERSION_OUTPUT="$("$NEW_BIN" --version 2>/dev/null || true)"
+if [ "${VERSION_OUTPUT##* }" != "$EXPECTED_VERSION" ]; then
+  echo "error: downloaded binary version mismatch: expected ${EXPECTED_VERSION}, got ${VERSION_OUTPUT:-unknown}"
+  exit 1
 fi
 
+# ── Install ───────────────────────────────────────────────────────────────
+
+echo "staging update next to ${TARGET_BIN} ..."
+run_privileged install -m 755 "$NEW_BIN" "$STAGED_BIN"
+
+STAGED_VERSION="$("$STAGED_BIN" --version 2>/dev/null || true)"
+if [ "${STAGED_VERSION##* }" != "$EXPECTED_VERSION" ]; then
+  echo "error: staged binary version mismatch"
+  exit 1
+fi
+
+WAS_RUNNING=0
+DAEMON_PORT=4027
+RUNTIME_FILE="${HOME}/.config/corplink/daemon-runtime.json"
+if [ -f "$TARGET_BIN" ]; then
+  if [ -f "$RUNTIME_FILE" ]; then
+    SAVED_PORT="$(sed -n 's/.*"port":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$RUNTIME_FILE")"
+    if [ -n "$SAVED_PORT" ]; then
+      DAEMON_PORT="$SAVED_PORT"
+    fi
+  fi
+  STATUS_OUTPUT="$("$TARGET_BIN" status --port "$DAEMON_PORT" 2>/dev/null || true)"
+  case "$STATUS_OUTPUT" in
+    "daemon is running"*)
+    WAS_RUNNING=1
+    ;;
+  esac
+fi
+
+if [ -f "$TARGET_BIN" ]; then
+  run_privileged cp -p "$TARGET_BIN" "$BACKUP_BIN"
+fi
+sync
+
+if [ "$WAS_RUNNING" -eq 1 ]; then
+  echo "stopping running corplink daemon ..."
+  if ! "$TARGET_BIN" stop; then
+    echo "error: failed to stop running daemon; existing installation was not changed"
+    exit 1
+  fi
+fi
+
+echo "installing to ${TARGET_BIN} ..."
+if ! run_privileged mv -f "$STAGED_BIN" "$TARGET_BIN"; then
+  echo "error: atomic install failed; existing binary was not changed"
+  if [ "$WAS_RUNNING" -eq 1 ]; then
+    "$TARGET_BIN" start --port "$DAEMON_PORT" --no-open || true
+  fi
+  exit 1
+fi
+
+INSTALLED_VERSION="$("$TARGET_BIN" --version 2>/dev/null || true)"
+if [ "${INSTALLED_VERSION##* }" != "$EXPECTED_VERSION" ]; then
+  echo "error: installed binary validation failed; rolling back"
+  if [ -f "$BACKUP_BIN" ]; then
+    run_privileged mv -f "$BACKUP_BIN" "$TARGET_BIN"
+  fi
+  if [ "$WAS_RUNNING" -eq 1 ]; then
+    "$TARGET_BIN" start --port "$DAEMON_PORT" --no-open || true
+  fi
+  exit 1
+fi
+
+if [ "$WAS_RUNNING" -eq 1 ]; then
+  echo "restarting corplink daemon on port ${DAEMON_PORT} ..."
+  if ! "$TARGET_BIN" start --port "$DAEMON_PORT" --no-open; then
+    echo "error: new daemon failed to start; rolling back"
+    if [ -f "$BACKUP_BIN" ]; then
+      "$TARGET_BIN" stop || true
+      run_privileged mv -f "$BACKUP_BIN" "$TARGET_BIN"
+      "$TARGET_BIN" start --port "$DAEMON_PORT" --no-open || true
+    fi
+    exit 1
+  fi
+fi
+
+run_privileged rm -f "$BACKUP_BIN"
+
 echo ""
-echo "corplink ${TAG} installed to ${INSTALL_DIR}/${BIN_NAME}"
+echo "corplink ${TAG} installed to ${TARGET_BIN}"
 echo ""
 echo "get started:"
 echo "  corplink serve        # start web UI"

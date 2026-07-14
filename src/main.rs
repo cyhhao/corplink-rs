@@ -9,6 +9,7 @@ mod resp;
 mod state;
 mod template;
 mod totp;
+mod updater;
 mod utils;
 mod web;
 mod wg;
@@ -23,7 +24,7 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::process::exit;
 
-use cli::{Cli, Command};
+use cli::{Cli, Command, DEFAULT_PORT};
 use client::Client;
 use config::{Config, WgConf};
 
@@ -112,6 +113,57 @@ pub(crate) fn cookies_dir() -> PathBuf {
 /// Path to the PID file: `~/.config/corplink/daemon.pid`.
 fn pid_file_path() -> PathBuf {
     config_dir().join("daemon.pid")
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct DaemonRuntimeInfo {
+    pid: u32,
+    port: u16,
+}
+
+fn daemon_runtime_path() -> PathBuf {
+    config_dir().join("daemon-runtime.json")
+}
+
+fn write_daemon_runtime(pid: u32, port: u16) {
+    let info = DaemonRuntimeInfo { pid, port };
+    match serde_json::to_vec(&info) {
+        Ok(data) => {
+            if let Err(e) = std::fs::write(daemon_runtime_path(), data) {
+                log::warn!("failed to write daemon runtime info: {}", e);
+            }
+        }
+        Err(e) => log::warn!("failed to serialize daemon runtime info: {}", e),
+    }
+}
+
+fn read_daemon_port(pid: u32) -> Option<u16> {
+    let data = std::fs::read(daemon_runtime_path()).ok()?;
+    let info: DaemonRuntimeInfo = serde_json::from_slice(&data).ok()?;
+    (info.pid == pid).then_some(info.port)
+}
+
+fn remove_daemon_runtime_for(expected_pid: u32) {
+    let runtime_info = std::fs::read(daemon_runtime_path())
+        .ok()
+        .and_then(|data| serde_json::from_slice::<DaemonRuntimeInfo>(&data).ok());
+    let should_remove = match runtime_info {
+        Some(info) => info.pid == expected_pid,
+        None => true,
+    };
+    if should_remove {
+        let _ = std::fs::remove_file(daemon_runtime_path());
+    }
+}
+
+fn remove_daemon_state_for(expected_pid: u32) {
+    remove_pid_file_for(expected_pid);
+    remove_daemon_runtime_for(expected_pid);
+}
+
+fn remove_daemon_state() {
+    remove_pid_file();
+    let _ = std::fs::remove_file(daemon_runtime_path());
 }
 
 /// Read the PID recorded in the PID file, rejecting obviously invalid values.
@@ -324,6 +376,23 @@ async fn main() {
         Command::Status { port } => cmd_status(port).await,
         Command::Profiles => cmd_profiles(),
         Command::Update { check } => cmd_update(check).await,
+        Command::ApplyUpdate {
+            target,
+            staged,
+            backup,
+            expected_version,
+            parent_pid,
+            restart_port,
+            cleanup_dir,
+        } => cmd_apply_update(
+            &target,
+            &staged,
+            &backup,
+            &expected_version,
+            parent_pid,
+            restart_port,
+            &cleanup_dir,
+        ),
     }
 }
 
@@ -343,7 +412,7 @@ fn cmd_start(port: u16, no_open: bool) {
     }
 
     // Clean up any stale PID file (lock not held ⇒ safe to remove).
-    remove_pid_file();
+    remove_daemon_state();
 
     let exe = std::env::current_exe().unwrap_or_else(|e| {
         eprintln!("cannot find self: {}", e);
@@ -410,7 +479,7 @@ fn cmd_start(port: u16, no_open: bool) {
         }
     } else {
         // Only remove PID file if it belongs to the child we spawned.
-        remove_pid_file_for(pid);
+        remove_daemon_state_for(pid);
         eprintln!(
             "daemon failed to start — check logs at {}",
             log_path.display()
@@ -423,19 +492,23 @@ fn cmd_start(port: u16, no_open: bool) {
 // `corplink stop` — send SIGTERM and wait for the daemon to exit
 // ---------------------------------------------------------------------------
 
-fn cmd_stop() {
+enum StopOutcome {
+    NotRunning,
+    Stopped(u32),
+    Killed(u32),
+}
+
+fn stop_daemon() -> Result<StopOutcome, String> {
     if !is_daemon_locked() {
         // No daemon holds the lock — clean up any stale PID file.
-        remove_pid_file();
-        println!("daemon is not running");
-        return;
+        remove_daemon_state();
+        return Ok(StopOutcome::NotRunning);
     }
 
     let pid = match read_daemon_pid() {
         Some(pid) => pid,
         None => {
-            eprintln!("daemon appears to be running (lock held) but PID is unknown");
-            exit(EPERM);
+            return Err("daemon appears to be running (lock held) but PID is unknown".to_string());
         }
     };
 
@@ -447,12 +520,10 @@ fn cmd_stop() {
         if ret != 0 {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::ESRCH) {
-                println!("daemon (pid {}) already exited", pid);
-                remove_pid_file();
-                return;
+                remove_daemon_state_for(pid);
+                return Ok(StopOutcome::Stopped(pid));
             }
-            eprintln!("failed to send SIGTERM to pid {}: {}", pid, err);
-            exit(EPERM);
+            return Err(format!("failed to send SIGTERM to pid {}: {}", pid, err));
         }
     }
     #[cfg(windows)]
@@ -463,12 +534,10 @@ fn cmd_stop() {
         {
             Ok(status) if status.success() => {}
             Ok(_) => {
-                eprintln!("failed to stop daemon pid {}", pid);
-                exit(EPERM);
+                return Err(format!("failed to stop daemon pid {}", pid));
             }
             Err(e) => {
-                eprintln!("failed to run taskkill for pid {}: {}", pid, e);
-                exit(EPERM);
+                return Err(format!("failed to run taskkill for pid {}: {}", pid, e));
             }
         }
     }
@@ -477,9 +546,8 @@ fn cmd_stop() {
     for _ in 0..32 {
         std::thread::sleep(std::time::Duration::from_millis(250));
         if !is_process_running(pid) {
-            remove_pid_file();
-            println!("daemon stopped (pid {})", pid);
-            return;
+            remove_daemon_state_for(pid);
+            return Ok(StopOutcome::Stopped(pid));
         }
     }
 
@@ -507,12 +575,23 @@ fn cmd_stop() {
         }
     }
 
-    remove_pid_file();
+    remove_daemon_state_for(pid);
     if is_process_running(pid) {
-        eprintln!("failed to kill daemon (pid {})", pid);
-        exit(EPERM);
+        return Err(format!("failed to kill daemon (pid {})", pid));
     }
-    println!("daemon killed (pid {})", pid);
+    Ok(StopOutcome::Killed(pid))
+}
+
+fn cmd_stop() {
+    match stop_daemon() {
+        Ok(StopOutcome::NotRunning) => println!("daemon is not running"),
+        Ok(StopOutcome::Stopped(pid)) => println!("daemon stopped (pid {})", pid),
+        Ok(StopOutcome::Killed(pid)) => println!("daemon killed (pid {})", pid),
+        Err(e) => {
+            eprintln!("{}", e);
+            exit(EPERM);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -559,6 +638,7 @@ async fn cmd_serve(port: u16, no_open: bool) {
     };
     let my_pid = std::process::id();
     write_daemon_pid(my_pid);
+    write_daemon_runtime(my_pid, port);
 
     if !no_open {
         let url = format!("http://localhost:{}", port);
@@ -575,11 +655,11 @@ async fn cmd_serve(port: u16, no_open: bool) {
     let state_for_shutdown = state.clone();
     if let Err(e) = web::serve(state, port, listener, state_for_shutdown).await {
         log::error!("web server error: {}", e);
-        remove_pid_file_for(my_pid);
+        remove_daemon_state_for(my_pid);
         exit(EPERM);
     }
 
-    remove_pid_file_for(my_pid);
+    remove_daemon_state_for(my_pid);
     // _lock_guard is dropped here, releasing the flock
 }
 
@@ -1427,6 +1507,183 @@ fn platform_asset_suffix() -> Option<(&'static str, &'static str)> {
     Some((os, arch))
 }
 
+fn restart_daemon_with_binary(binary: &std::path::Path, port: u16) -> Result<(), String> {
+    let status = std::process::Command::new(binary)
+        .args(["start", "--port", &port.to_string(), "--no-open"])
+        .status()
+        .map_err(|e| format!("failed to restart daemon: {}", e))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "daemon restart exited with {}",
+            status.code().unwrap_or(-1)
+        ))
+    }
+}
+
+fn stop_daemon_for_update() -> Result<(), String> {
+    match stop_daemon()? {
+        StopOutcome::NotRunning => Ok(()),
+        StopOutcome::Stopped(pid) => {
+            println!("daemon stopped for update (pid {})", pid);
+            Ok(())
+        }
+        StopOutcome::Killed(pid) => {
+            println!("daemon force-stopped for update (pid {})", pid);
+            Ok(())
+        }
+    }
+}
+
+async fn running_daemon_version(http: &reqwest::Client, port: u16) -> Option<String> {
+    let url = format!("http://127.0.0.1:{}/api/version", port);
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        http.get(url).send(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let body: serde_json::Value = response.json().await.ok()?;
+    body["data"]["version"]
+        .as_str()
+        .map(normalize_version)
+}
+
+fn rollback_update(
+    prepared: &updater::PreparedUpdate,
+    restart_port: Option<u16>,
+) -> Result<(), String> {
+    if find_running_daemon().is_some() {
+        let _ = stop_daemon();
+    }
+    prepared.rollback()?;
+    if let Some(port) = restart_port {
+        restart_daemon_with_binary(prepared.target(), port)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn spawn_windows_update_helper(
+    current_exe: &std::path::Path,
+    prepared: &updater::PreparedUpdate,
+    expected_version: &str,
+    restart_port: Option<u16>,
+    cleanup_dir: &std::path::Path,
+) -> Result<(), String> {
+    let helper = cleanup_dir.join("corplink-update-helper.exe");
+    updater::copy_executable(current_exe, &helper)?;
+
+    let mut command = std::process::Command::new(&helper);
+    command
+        .arg("apply-update")
+        .arg("--target")
+        .arg(prepared.target())
+        .arg("--staged")
+        .arg(prepared.staged())
+        .arg("--backup")
+        .arg(prepared.backup())
+        .arg("--expected-version")
+        .arg(expected_version)
+        .arg("--parent-pid")
+        .arg(std::process::id().to_string())
+        .arg("--cleanup-dir")
+        .arg(cleanup_dir);
+    if let Some(port) = restart_port {
+        command.arg("--restart-port").arg(port.to_string());
+    }
+
+    command
+        .spawn()
+        .map_err(|e| format!("failed to start update helper: {}", e))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn cmd_apply_update(
+    target: &str,
+    staged: &str,
+    backup: &str,
+    expected_version: &str,
+    parent_pid: u32,
+    restart_port: Option<u16>,
+    cleanup_dir: &str,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while is_process_running(parent_pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if is_process_running(parent_pid) {
+        eprintln!("update parent process {} did not exit", parent_pid);
+        if let Some(port) = restart_port {
+            let _ = restart_daemon_with_binary(std::path::Path::new(target), port);
+        }
+        exit(EPERM);
+    }
+
+    let prepared = updater::PreparedUpdate::from_paths(
+        PathBuf::from(target),
+        PathBuf::from(staged),
+        PathBuf::from(backup),
+    );
+
+    let result = prepared
+        .apply()
+        .and_then(|_| updater::verify_binary_version(prepared.target(), expected_version))
+        .and_then(|_| {
+            restart_port.map_or(Ok(()), |port| {
+                restart_daemon_with_binary(prepared.target(), port)
+            })
+        });
+
+    if let Err(e) = result {
+        eprintln!("update failed: {}", e);
+        match rollback_update(&prepared, restart_port) {
+            Ok(_) => eprintln!("restored previous version"),
+            Err(rollback_err) => eprintln!("rollback failed: {}", rollback_err),
+        }
+        prepared.cleanup();
+        exit(EPERM);
+    }
+
+    prepared.cleanup();
+    let helper = std::env::current_exe().ok();
+    let cleanup_dir = PathBuf::from(cleanup_dir);
+    if let Ok(entries) = std::fs::read_dir(&cleanup_dir) {
+        for entry in entries.flatten() {
+            if helper.as_ref().map_or(true, |path| entry.path() != *path) {
+                let path = entry.path();
+                if path.is_dir() {
+                    let _ = std::fs::remove_dir_all(path);
+                } else {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+    }
+    if let Some(ref helper) = helper {
+        updater::schedule_delete_on_reboot(helper);
+    }
+    updater::schedule_delete_on_reboot(&cleanup_dir);
+    println!("updated to {} successfully!", expected_version);
+}
+
+#[cfg(not(windows))]
+fn cmd_apply_update(
+    _target: &str,
+    _staged: &str,
+    _backup: &str,
+    _expected_version: &str,
+    _parent_pid: u32,
+    _restart_port: Option<u16>,
+    _cleanup_dir: &str,
+) {
+    eprintln!("apply-update is only used on Windows");
+    exit(EPERM);
+}
+
 async fn cmd_update(check_only: bool) {
     let current_version = env!("BUILD_VERSION");
     println!("current version: {}", current_version);
@@ -1474,6 +1731,29 @@ async fn cmd_update(check_only: bool) {
 
     // 2. Compare versions.
     if latest == current {
+        if !check_only {
+            if let Some(pid) = find_running_daemon() {
+                let port = read_daemon_port(pid).unwrap_or(DEFAULT_PORT);
+                if let Some(daemon_version) = running_daemon_version(&http, port).await {
+                    if daemon_version != current {
+                        println!(
+                            "daemon is still running version {}; restarting with {} ...",
+                            daemon_version, current
+                        );
+                        let restart_result = stop_daemon_for_update().and_then(|_| {
+                            let current_exe = std::env::current_exe().map_err(|e| {
+                                format!("cannot determine current executable path: {}", e)
+                            })?;
+                            restart_daemon_with_binary(&current_exe, port)
+                        });
+                        if let Err(e) = restart_result {
+                            eprintln!("failed to refresh running daemon: {}", e);
+                            exit(EPERM);
+                        }
+                    }
+                }
+            }
+        }
         println!("already up to date.");
         return;
     }
@@ -1551,7 +1831,8 @@ async fn cmd_update(check_only: bool) {
         }
     };
 
-    let tmp_dir = std::env::temp_dir().join("corplink-update");
+    let tmp_dir =
+        std::env::temp_dir().join(format!("corplink-update-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp_dir);
     std::fs::create_dir_all(&tmp_dir).expect("failed to create temp dir");
 
@@ -1600,7 +1881,9 @@ async fn cmd_update(check_only: bool) {
         }
     };
 
-    // 7. Replace the current executable.
+    // 7. Prepare a verified staging file and backup next to the target.
+    // This happens before stopping the daemon, so permission or validation
+    // failures do not interrupt the running service.
     let current_exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
@@ -1610,32 +1893,72 @@ async fn cmd_update(check_only: bool) {
         }
     };
 
-    // Set executable permission on the new binary.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&new_binary, std::fs::Permissions::from_mode(0o755));
-    }
+    println!("validating and staging update ...");
+    let prepared = match updater::PreparedUpdate::prepare(&new_binary, &current_exe, &latest) {
+        Ok(prepared) => prepared,
+        Err(e) => {
+            eprintln!("{}", e);
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            exit(EPERM);
+        }
+    };
 
-    // On Unix, we can atomically replace a running binary via rename.
-    // If cross-device, fall back to copy.
-    println!("installing to {} ...", current_exe.display());
-    if std::fs::rename(&new_binary, &current_exe).is_err() {
-        if let Err(e) = std::fs::copy(&new_binary, &current_exe) {
-            eprintln!("failed to install new binary: {}", e);
-            eprintln!("you may need to run with sudo or copy manually:");
-            eprintln!(
-                "  sudo cp {} {}",
-                new_binary.display(),
-                current_exe.display()
-            );
+    let restart_port =
+        find_running_daemon().map(|pid| read_daemon_port(pid).unwrap_or(DEFAULT_PORT));
+
+    if restart_port.is_some() {
+        println!("stopping daemon before installing update ...");
+        if let Err(e) = stop_daemon_for_update() {
+            eprintln!("failed to stop daemon: {}", e);
+            prepared.cleanup();
             let _ = std::fs::remove_dir_all(&tmp_dir);
             exit(EPERM);
         }
     }
 
-    // 8. Cleanup.
-    let _ = std::fs::remove_dir_all(&tmp_dir);
+    println!("installing to {} ...", current_exe.display());
 
-    println!("updated to {} successfully!", latest);
+    #[cfg(windows)]
+    {
+        if let Err(e) =
+            spawn_windows_update_helper(&current_exe, &prepared, &latest, restart_port, &tmp_dir)
+        {
+            eprintln!("{}", e);
+            if let Some(port) = restart_port {
+                let _ = restart_daemon_with_binary(&current_exe, port);
+            }
+            prepared.cleanup();
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            exit(EPERM);
+        }
+        println!("update helper started; installation will finish after this process exits");
+        return;
+    }
+
+    #[cfg(not(windows))]
+    {
+        let install_result = prepared
+            .apply()
+            .and_then(|_| updater::verify_binary_version(prepared.target(), &latest))
+            .and_then(|_| {
+                restart_port.map_or(Ok(()), |port| {
+                    restart_daemon_with_binary(prepared.target(), port)
+                })
+            });
+
+        if let Err(e) = install_result {
+            eprintln!("update failed: {}", e);
+            match rollback_update(&prepared, restart_port) {
+                Ok(_) => eprintln!("restored previous version"),
+                Err(rollback_err) => eprintln!("rollback failed: {}", rollback_err),
+            }
+            prepared.cleanup();
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            exit(EPERM);
+        }
+
+        prepared.cleanup();
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        println!("updated to {} successfully!", latest);
+    }
 }
